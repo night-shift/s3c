@@ -1,7 +1,7 @@
 lib_name      = s3c
 lib_files     = src/s3c.c
 test_files    = tests/main.c
-exmaple_files = examples/usage.c
+example_files = examples/usage.c
 out_dir       = bin
 link_libs     = -lssl -lcrypto
 CFLAGS        = -std=c99 -Wall -Wextra -Wcast-align -pedantic -fPIC
@@ -21,7 +21,7 @@ lib          = $(out_dir)/lib$(lib_name)
 
 lib_objs     = $(patsubst %.c,$(cache)/%.o, $(lib_files))
 test_objs    = $(patsubst %.c,$(cache)/%.o, $(test_files))
-example_objs = $(patsubst %.c,$(cache)/%.o, $(exmaple_files))
+example_objs = $(patsubst %.c,$(cache)/%.o, $(example_files))
 
 .DEFAULT_GOAL := static
 
