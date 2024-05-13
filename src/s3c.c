@@ -935,12 +935,15 @@ create_socket_bio(const char *host, const char *port, int family)
             continue;
         }
 
-        if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
-            setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        if (S3C_GLOBAL_CONFS.net_io_timeout_sec > 0) {
 
-            BIO_closesocket(sock);
-            sock = -1;
-            continue;
+            if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+                setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+
+                BIO_closesocket(sock);
+                sock = -1;
+                continue;
+            }
         }
 
         if (!BIO_connect(sock, BIO_ADDRINFO_address(ai),
@@ -1125,6 +1128,7 @@ ossl_io_read(OsslContext* octx, uint8_t* in_buf, size_t in_buf_size,
     *out_bytes_recv = 0;
     int io_res = 0;
 
+    errno = 0;
     io_res = SSL_read_ex(octx->ssl, in_buf, in_buf_size,
                          out_bytes_recv);
 
