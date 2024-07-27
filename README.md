@@ -1,5 +1,4 @@
 ### Basic AWS S3 library in C
-
 ```c
 #include "../src/s3c.h"
 
@@ -128,3 +127,10 @@ int main(int argc, char** argv)
     return 0;
 }
 ```
+
+### Dependencies
+compile with -lssl -lcrypto
+
+
+
+
