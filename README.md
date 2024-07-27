@@ -19,8 +19,8 @@ int main(int argc, char** argv)
         .access_key_id     = argv[1], // S3 Access Key ID
         .access_key_secret = argv[2], // S3 Secret Access Key
         .region            = argv[3], // Example: eu-west-1
-        .endpoint          = NULL,    // Endpoint URL is optional and defaults to the
-                                      // standard AWS form
+        .endpoint          = NULL,    // Endpoint URL is optional and defaults to
+                                      // the standard AWS form
     };
     // Set a sepcific endpoint if you want to use a custom S3-compatible service
     if (argc > 4) {
@@ -45,14 +45,15 @@ int main(int argc, char** argv)
                 s3_bucket, (unsigned)reply->http_resp_code);
     }
 
-    // Always free the reply to prevent memory leaks. Each API call generates a
-    // new reply struct that must be managed
+    // Always free the reply to prevent memory leaks. Each API call generates
+    // a new reply struct that must be managed
     s3c_reply_free(reply);
 
     const char* object_key = "fruits.txt";
     const char* content = "banana orange strawberry";
 
-    // Put object with key "fruits.txt", any such object within the bucket will be overwritten
+    // Put object with key "fruits.txt"
+    // any such object within the bucket will be overwritten
     reply = s3c_put_object(&keys, s3_bucket, object_key,
                           (const uint8_t*)content, strlen(content),
                            NULL);
@@ -88,7 +89,8 @@ int main(int argc, char** argv)
     if (reply->error != NULL) {
         printf("s3c_get_object failed with error => %s\n", reply->error);
     } else {
-        // If successful (error == NULL) reply->data points to the content of the requested object
+        // If successful (error == NULL) reply->data points to the content
+        // of the requested object
         // Note: reply->data is always terminated with an additional zero-byte
         printf("content for %s fetched, content size: %u content: %s\n",
                object_key, (unsigned)reply->data_size, (char*)reply->data);
