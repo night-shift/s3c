@@ -40,6 +40,10 @@ s3cReply* s3c_put_object(const s3cKeys*,
 s3cReply* s3c_get_object(const s3cKeys*,
                          const char* bucket, const char* object_key);
 
+s3cReply* s3c_get_object_to_file(const s3cKeys*,
+                                 const char* bucket, const char* object_key,
+                                 const char* out_file);
+
 s3cReply* s3c_delete_object(const s3cKeys*,
                             const char* bucket, const char* object_key);
 
