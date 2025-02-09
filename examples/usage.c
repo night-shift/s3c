@@ -33,7 +33,7 @@ int main(int argc, char** argv)
     }
 
     // First, create the bucket
-    s3cReply* reply = s3c_create_bucket(&keys, s3_bucket);
+    s3cReply* reply = s3c_create_bucket(&keys, s3_bucket, NULL);
 
     // An error will be returned if the bucket already exists
     if (reply->error != NULL) {
@@ -65,10 +65,9 @@ int main(int argc, char** argv)
     s3c_reply_free(reply);
 
     // Headers like "content-type" can be passed via a list struct.
-    // Passing headers is optional. "content-length" will be set automatically,
-    // likewise "x-amzn-acl" will be set to "private" when no such header is provided.
-    s3cHeader ct_header  = { "content-type", "text/plain", NULL };
-    s3cHeader acl_header = { "x-amzn-acl", "bucket-owner-full-control", &ct_header };
+    // Passing headers is optional. "content-length" will be set automatically
+    s3cKVL ct_header  = { "content-type", "text/plain", NULL };
+    s3cKVL acl_header = { "x-amzn-acl", "bucket-owner-full-control", &ct_header };
 
     reply = s3c_put_object(&keys, s3_bucket, object_key,
                            (const uint8_t*)content, strlen(content),
@@ -93,8 +92,8 @@ int main(int argc, char** argv)
 
         // Print reply headers
         puts("Reply headers:");
-        for (s3cHeader* h = reply->headers; h != NULL; h = h->next) {
-            printf("\t%s => %s\n", h->name, h->value);
+        for (s3cKVL* h = reply->headers; h != NULL; h = h->next) {
+            printf("\t%s => %s\n", h->key, h->value);
         }
     }
     // Freeing the reply object also frees the reply data and headers

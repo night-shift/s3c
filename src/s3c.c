@@ -29,8 +29,6 @@
 static const char* S3_SIGNATURE_PREFIX  = "AWS4";
 static const char* S3_SIGNATURE_ALGO    = "AWS4-HMAC-SHA256";
 static const char* S3_REQUEST_TYPE      = "aws4_request";
-static const char* S3_HEADER_ACL        = "x-amz-acl";
-static const char* S3_ACL_VALUE_DEFAULT = "private";
 static const char* S3_HTTP_VERSION      = "HTTP/1.1";
 
 #define S3C_SHA256_BIN_SIZE 32
@@ -43,11 +41,15 @@ static struct {
     uint32_t net_io_timeout_sec;
     uint32_t max_reply_prealloc_size_mb;
     uint32_t str_buf_max_cap_reserve_mb;
+    uint32_t multipart_file_sz_trigger_mb;
+    uint32_t multipart_send_max_retries;
 
 } S3C_GLOBAL_CONFS = {
-    .net_io_timeout_sec         = 15,
-    .max_reply_prealloc_size_mb = 512,
-    .str_buf_max_cap_reserve_mb = 10,
+    .net_io_timeout_sec           = 15,
+    .max_reply_prealloc_size_mb   = 128,
+    .str_buf_max_cap_reserve_mb   = 10,
+    .multipart_file_sz_trigger_mb = 6,
+    .multipart_send_max_retries   = 2,
 };
 
 typedef struct {
@@ -60,12 +62,13 @@ static void        ossl_free(OsslContext*);
 static const char* ossl_connect(OsslContext*, const char* host);
 
 typedef struct {
-    const char*      bucket;
-    const char*      object_key;
-    const uint8_t*   data;
-    uint64_t         data_size;
-    FILE*            fd;
-    const s3cHeader* headers;
+    const char*    bucket;
+    const char*    object_key;
+    const uint8_t* data;
+    uint64_t       data_size;
+    FILE*          fp;
+    const s3cKVL*  headers;
+    const s3cKVL*  query_args;
 } OpArgs;
 
 typedef struct {
@@ -104,10 +107,11 @@ static size_t str_push_char(StrBuf*, char);
 static size_t str_push_int(StrBuf*, int64_t);
 static size_t str_push_str(StrBuf*, const StrBuf*);
 static size_t str_push_cstr(StrBuf*, const char*);
+static size_t str_push_many(StrBuf* s, ...);
 static size_t str_set(StrBuf*, const char*);
 static char*  str_extract(StrBuf*);
 
-static void s3c_headers_upsert(s3cHeader** head, const char* name, const char* value);
+static void s3c_kvl_upsert(s3cKVL** head, const char* name, const char* value);
 
 uint32_t
 s3c_set_global_config(uint32_t opt, uint32_t value)
@@ -158,12 +162,11 @@ s3c_reply_free(s3cReply* reply)
         return;
     }
 
-    s3c_headers_free(reply->headers);
+    s3c_kvl_free(reply->headers);
 
     free(reply->error);
     free(reply->data);
 
-    memset(reply, 0, sizeof(s3cReply));
     free(reply);
 }
 
@@ -173,14 +176,17 @@ check_arg_str(const char* arg, const char* arg_name)
     StrBuf err_buf = str_init(0);
 
     if (arg == NULL) {
-        str_set(&err_buf, "provided arguments missing value for <");
-        str_push_cstr(&err_buf, arg_name);
-        str_push_char(&err_buf, '>');
+
+        str_push_many(
+            &err_buf,
+            "provided arguments missing value for <", arg_name, ">", NULL
+        );
 
     } else if (*arg == '\0') {
-        str_set(&err_buf, "provided argument empty string for value <");
-        str_push_cstr(&err_buf, arg_name);
-        str_push_char(&err_buf, '>');
+        str_push_many(
+            &err_buf,
+            "provided argument empty string for value <", arg_name, ">", NULL
+        );
     }
 
     if (err_buf.len > 0) {
@@ -252,7 +258,7 @@ s3c_get_object(const s3cKeys* keys,
 s3cReply*
 s3c_get_object_to_file(const s3cKeys* keys,
                        const char* bucket, const char* object_key,
-                       const char* out_file)
+                       const char* file)
 {
     s3cReply* err = NULL;
 
@@ -261,34 +267,35 @@ s3c_get_object_to_file(const s3cKeys* keys,
     }
 
 
-    if ((err = check_arg_str(out_file, "out_file")) != NULL) {
+    if ((err = check_arg_str(file, "out_file")) != NULL) {
         return err;
     }
 
-    FILE *file = fopen(out_file, "w");
+    FILE* fp = fopen(file, "w");
 
-    if (!file) {
-        err = s3c_reply_alloc("failed to open file");
+    if (fp == NULL) {
+        err = s3c_reply_alloc("failed to open file for write");
         return err;
     }
 
     OpArgs args = {
         .bucket = bucket,
         .object_key = object_key,
-        .fd = file,
+        .fp = fp,
     };
 
     s3cReply* res = run_s3_op(keys, "GET", args);
 
-    fclose(file);
+    fclose(fp);
 
     return res;
 }
 
 s3cReply*
-s3c_put_object(const s3cKeys* keys, const char* bucket, const char* object_key,
-                                    const uint8_t* data, uint64_t data_size,
-                                    const s3cHeader* headers)
+s3c_put_object(const s3cKeys* keys,
+               const char* bucket, const char* object_key,
+               const uint8_t* data, uint64_t data_size,
+               const s3cKVL* headers)
 {
     s3cReply* err = check_arg_bucket_key(bucket, object_key);
 
@@ -312,7 +319,375 @@ s3c_put_object(const s3cKeys* keys, const char* bucket, const char* object_key,
         .headers = headers,
     };
 
-    return run_s3_op(keys, "PUT", args);
+    s3cReply* reply = run_s3_op(keys, "PUT", args);
+
+    return reply;
+}
+
+static void
+parse_xml_tag(const char* xml, const char* tag_name, StrBuf* out_buf)
+{
+    StrBuf tag_str = str_init(strlen(tag_name) + strlen("<>/"));
+    str_set(out_buf, "");
+
+    str_push_many(&tag_str, "<", tag_name, ">", NULL);
+
+    const char* msg_start = strstr(xml, tag_str.ptr);
+
+    if (msg_start == NULL) {
+        goto cleanup_and_ret;
+    }
+
+    msg_start += tag_str.len;
+
+    tag_str.len = 0;
+    str_push_many(&tag_str, "</", tag_name, ">", NULL);
+
+    const char* msg_end = strstr(msg_start, tag_str.ptr);
+
+    if (msg_end == NULL) {
+        goto cleanup_and_ret;
+    }
+
+    ptrdiff_t diff = msg_end - msg_start;
+    str_push(out_buf, msg_start, diff);
+
+cleanup_and_ret:
+    str_destroy(&tag_str);
+}
+
+static s3cReply*
+s3c_multipart_upload_abort(const s3cKeys* keys,
+                           const char* bucket, const char* obj_key,
+                           const char* upload_id)
+{
+    s3cKVL query_args = {
+        .key = "uploadId",
+        .value = (char*)upload_id,
+    };
+
+    OpArgs args = {
+        .bucket = bucket,
+        .object_key = obj_key,
+        .query_args = &query_args,
+    };
+
+    return run_s3_op(keys, "DELETE", args);
+}
+
+static s3cReply*
+s3c_multipart_upload_init(const s3cKeys* keys,
+                          const char* bucket, const char* object_key,
+                          const s3cKVL* headers,
+                          StrBuf* out_upload_id)
+{
+    s3cKVL query_args = {
+        .key = "uploads",
+        .value = "",
+    };
+
+    OpArgs args = {
+        .bucket = bucket,
+        .object_key = object_key,
+        .headers = headers,
+        .query_args = &query_args,
+    };
+
+    s3cReply* reply = run_s3_op(keys, "POST", args);
+
+    if (reply->error) {
+        return reply;
+    }
+
+    if (reply->data == NULL) {
+        reply->error = str_dup("multipart init failed to parse reply upload id, no reply body");
+        return reply;
+    }
+
+    str_set(out_upload_id, "");
+    parse_xml_tag((const char*)reply->data, "UploadId", out_upload_id);
+
+    if (out_upload_id->len < 1) {
+        reply->error = str_dup("multipart init failed to parse reply upload id");
+        return reply;
+    }
+
+    return reply;
+}
+
+static s3cReply*
+s3c_multipart_upload_finish(const s3cKeys* keys,
+                           const char* bucket, const char* object_key,
+                           const char* upload_id, s3cKVL* etags)
+{
+    StrBuf body = str_init(512);
+    StrBuf error_tag = {0};
+
+    str_push_cstr(&body, "<CompleteMultipartUpload "
+                         "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
+
+    s3cKVL* etag = etags;
+    int part_num = 0;
+
+    for (; etag != NULL; etag = etag->next, part_num++) {
+        str_push_many(
+            &body,
+            "<Part>",
+            "<ETag>", etag->value, "</ETag>",
+            "<PartNumber>",
+            NULL
+        );
+        str_push_int(&body, part_num + 1);
+        str_push_cstr(&body, "</PartNumber></Part>");
+    }
+
+    str_push_cstr(&body, "</CompleteMultipartUpload>");
+
+    s3cKVL query_args = {
+        .key = "uploadId",
+        .value = (char*)upload_id,
+    };
+
+    OpArgs args = {
+        .bucket = bucket,
+        .object_key = object_key,
+        .data = (const uint8_t*)body.ptr,
+        .data_size = body.len,
+        .query_args = &query_args,
+    };
+
+    s3cReply* reply = run_s3_op(keys, "POST", args);
+
+    if (reply->error) {
+        goto cleanup_and_ret;
+    }
+
+    // CompleteMultipartUpload can return 200 OK with error specified in body
+    parse_xml_tag((const char*)reply->data, "Error", &error_tag);
+
+    if (error_tag.len > 0) {
+        parse_xml_tag((const char*)reply->data, "Message", &error_tag);
+
+        reply->error = error_tag.len > 0
+            ? str_extract(&error_tag)
+            : str_dup((const char*)reply->data);
+    }
+
+
+cleanup_and_ret:
+    str_destroy(&body);
+    str_destroy(&error_tag);
+    return reply;
+}
+
+static s3cReply*
+s3c_multipart_upload_run(const s3cKeys* keys, const char* bucket, const char* obj_key,
+                         FILE* fp, size_t file_size, const char* upload_id)
+{
+    const size_t MULTIPART_CHUNK_SZ = 5 * 1024 * 1024;
+
+    uint8_t* chunk_buf = malloc(MULTIPART_CHUNK_SZ);
+    s3cReply* reply = NULL;
+    s3cKVL* etags_head = NULL;
+    s3cKVL* etags_tail = NULL;
+    StrBuf iota_buf = {0};
+
+    fseek(fp, 0, SEEK_SET);
+
+    size_t left_to_send = file_size;
+
+    s3cKVL q_arg_upload_id = {
+        .key = "uploadId",
+        .value = (char*)upload_id,
+    };
+
+    s3cKVL q_arg_part_num = {
+        .key = "partNumber",
+        .value = NULL,
+        .next = &q_arg_upload_id,
+    };
+
+    OpArgs op_args = {
+        .bucket = bucket,
+        .object_key = obj_key,
+        .query_args = &q_arg_part_num,
+    };
+
+    int part_number = 0;
+
+    while (left_to_send > 0) {
+        size_t send_now = left_to_send > MULTIPART_CHUNK_SZ
+            ? MULTIPART_CHUNK_SZ
+            : left_to_send;
+
+        size_t bytes_read = fread(chunk_buf, 1, send_now, fp);
+
+        if (bytes_read < send_now) {
+            reply = s3c_reply_alloc("failed to read file");
+            goto cleanup_and_ret;
+        }
+
+        iota_buf.len = 0;
+        str_push_int(&iota_buf, part_number + 1);
+        q_arg_part_num.value = iota_buf.ptr;
+
+        op_args.data = chunk_buf;
+        op_args.data_size = send_now;
+
+        unsigned num_retries = 0;
+
+        while (1) {
+            reply = run_s3_op(keys, "PUT", op_args);
+
+            if (reply->error == NULL) {
+                break;
+            }
+
+            bool server_err = reply->http_resp_code == 500 ||
+                              reply->http_resp_code == 502 ||
+                              reply->http_resp_code == 503 ||
+                              reply->http_resp_code == 504;
+
+            if (!server_err || num_retries >= S3C_GLOBAL_CONFS.multipart_send_max_retries) {
+                goto cleanup_and_ret;
+            }
+
+            s3c_reply_free(reply);
+            num_retries += 1;
+        }
+
+        s3cKVL* etag = s3c_kvl_find(reply->headers, "ETag");
+
+        if (etag == NULL) {
+            s3c_reply_free(reply);
+            reply = s3c_reply_alloc("S3 reply missing header ETag");
+            goto cleanup_and_ret;
+        }
+
+        s3cKVL* etag_copy = malloc(sizeof(s3cKVL));
+        *etag_copy = *etag;
+        etag->key = NULL;
+        etag->value = NULL;
+        etag_copy->next = NULL;
+
+        if (etags_head == NULL) {
+            etags_head = etag_copy;
+        } else {
+            etags_tail->next = etag_copy;
+        }
+
+        etags_tail = etag_copy;
+        left_to_send -= send_now;
+        part_number += 1;
+        s3c_reply_free(reply);
+    }
+
+    reply = s3c_multipart_upload_finish(
+        keys, bucket, obj_key, upload_id, etags_head
+    );
+
+cleanup_and_ret:
+    free(chunk_buf);
+    s3c_kvl_free(etags_head);
+    str_destroy(&iota_buf);
+
+    return reply;
+}
+
+s3cReply*
+s3c_put_object_from_file(const s3cKeys* keys,
+                         const char* bucket, const char* object_key,
+                         const char* file, const s3cKVL* headers)
+{
+    size_t multipart_size_lim =
+        S3C_GLOBAL_CONFS.multipart_file_sz_trigger_mb
+        * 1024 * 1024;
+
+    s3cReply* err = check_arg_bucket_key(bucket, object_key);
+
+    if (err != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_str(file, "file")) != NULL) {
+        return err;
+    }
+
+    s3cReply* reply = NULL;
+    uint8_t* file_buf = NULL;
+    StrBuf upload_id = {0};
+    FILE* fp = fopen(file, "r");
+
+    if (fp == NULL) {
+        reply = s3c_reply_alloc("failed to open file for read");
+        goto cleanup_and_ret;
+    }
+
+    fseek(fp, 0, SEEK_END);
+    size_t file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (file_size < multipart_size_lim) {
+        file_buf = malloc(file_size);
+
+        if (file_buf == NULL) {
+            reply = s3c_reply_alloc("failed to alloc file buf");
+            goto cleanup_and_ret;
+        }
+
+        size_t bytes_read = fread(file_buf, 1, file_size, fp);
+
+        if (bytes_read < file_size) {
+            reply = s3c_reply_alloc("failed to read file");
+            goto cleanup_and_ret;
+        }
+
+        OpArgs args = {
+            .bucket = bucket,
+            .object_key = object_key,
+            .headers = headers,
+            .data = (const uint8_t*)file_buf,
+            .data_size = file_size,
+        };
+
+        reply = run_s3_op(keys, "PUT", args);
+        goto cleanup_and_ret;
+    }
+
+    reply = s3c_multipart_upload_init(
+        keys, bucket, object_key, headers,
+        &upload_id
+    );
+
+    if (reply->error) {
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(reply);
+
+    reply = s3c_multipart_upload_run(
+        keys, bucket, object_key,
+        fp, file_size, upload_id.ptr
+    );
+
+    if (reply->error) {
+        s3cReply* abort = s3c_multipart_upload_abort(
+            keys, bucket, object_key, upload_id.ptr
+        );
+
+        s3c_reply_free(abort);
+        goto cleanup_and_ret;
+    }
+
+
+cleanup_and_ret:
+    if (fp != NULL) {
+        fclose(fp);
+    }
+    free(file_buf);
+    str_destroy(&upload_id);
+
+    return reply;
 }
 
 s3cReply*
@@ -326,7 +701,7 @@ s3c_delete_object(const s3cKeys* keys,
     }
 
     OpArgs args = {
-        .bucket     = bucket,
+        .bucket = bucket,
         .object_key = object_key,
     };
 
@@ -334,7 +709,7 @@ s3c_delete_object(const s3cKeys* keys,
 }
 
 s3cReply*
-s3c_create_bucket(const s3cKeys* keys, const char* bucket)
+s3c_create_bucket(const s3cKeys* keys, const char* bucket, const s3cKVL* headers)
 {
     s3cReply* err = NULL;
 
@@ -353,6 +728,7 @@ s3c_create_bucket(const s3cKeys* keys, const char* bucket)
         .bucket = bucket,
         .data = (const uint8_t*)req_body.ptr,
         .data_size = req_body.len,
+        .headers = headers,
     };
 
     s3cReply* reply = run_s3_op(keys, "PUT", args);
@@ -499,26 +875,29 @@ gen_scope_string(const char* date, const char* s3_region)
 {
     StrBuf scope = str_init(128);
 
-    str_set      (&scope, date);
-    str_push_char(&scope, '/');
-    str_push_cstr(&scope, s3_region);
-    str_push_cstr(&scope, "/s3/");
-    str_push_cstr(&scope, S3_REQUEST_TYPE);
+    str_push_many(
+        &scope,
+        date, "/", s3_region, "/s3/", S3_REQUEST_TYPE,
+        NULL
+    );
 
     return scope;
 }
 
 static void
-gen_sig_header_entries(s3cHeader* headers_in,
+gen_sig_header_entries(s3cKVL* headers_in,
                        StrBuf* out_sig_headers,
                        StrBuf* out_sig_header_names)
 {
     StrBuf sbuf = str_init(128);
 
-    for (s3cHeader* h = headers_in; h; h = h->next) {
+    str_set(out_sig_headers, "");
+    str_set(out_sig_header_names, "");
 
-        /* header name for signature */
-        str_set(&sbuf, h->name);
+    for (s3cKVL* h = headers_in; h; h = h->next) {
+
+        // header name for signature
+        str_set(&sbuf, h->key);
 
         for (char* p = sbuf.ptr; *p != '\0'; p++) {
             *p = tolower(*p);
@@ -530,18 +909,19 @@ gen_sig_header_entries(s3cHeader* headers_in,
 
         str_push_str(out_sig_header_names, &sbuf);
 
-        /* header name + value for signature */
-        str_push_str (out_sig_headers, &sbuf);
-        str_push_char(out_sig_headers, ':');
-        str_push_cstr(out_sig_headers, h->value);
-        str_push_char(out_sig_headers, '\n');
+        // header name + value for signature
+        str_push_many(
+            out_sig_headers,
+            sbuf.ptr, ":", h->value, "\n",
+            NULL
+        );
     }
 
     str_destroy(&sbuf);
 }
 
 static void
-append_s3_escaped_string(const char* str, StrBuf* out_str)
+append_s3_escaped_string(StrBuf* str_buf, const char* str)
 {
     const char legal_chars[] = "/-_.";
 
@@ -552,19 +932,19 @@ append_s3_escaped_string(const char* str, StrBuf* out_str)
         bool do_escape = (c < '0' || c > '9') &&
                          (c < 'A' || c > 'Z') &&
                          (c < 'a' || c > 'z');
-        /* except legal chars */
+        // except legal chars
         for (size_t j = 0; do_escape && j < sizeof(legal_chars) - 1; j++) {
             do_escape = c != legal_chars[j];
         }
 
         if (!do_escape) {
-            str_push_char(out_str, c);
+            str_push_char(str_buf, c);
             continue;
         }
 
-        str_push_char(out_str, '%');
-        str_push_char(out_str, hex_lk[(c >> 4) & 0x0F]);
-        str_push_char(out_str, hex_lk[c & 0x0F]);
+        str_push_char(str_buf, '%');
+        str_push_char(str_buf, hex_lk[(c >> 4) & 0x0F]);
+        str_push_char(str_buf, hex_lk[c & 0x0F]);
     }
 }
 
@@ -603,10 +983,12 @@ hmac_sha256_from_bytes(const uint8_t* key, size_t key_size,
 {
     unsigned int digest_size = S3C_SHA256_BIN_SIZE;
 
-    void* res = HMAC(EVP_sha256(),
-                     key, key_size,
-                     data, data_size,
-                     out_buf, &digest_size);
+    void* res = HMAC(
+        EVP_sha256(),
+        key, key_size,
+        data, data_size,
+        out_buf, &digest_size
+    );
 
     return res != NULL && digest_size == S3C_SHA256_BIN_SIZE;
 }
@@ -623,24 +1005,33 @@ gen_signing_key(const s3cKeys* keys, const char* date_stamp,
     str_set(&sig_root, S3_SIGNATURE_PREFIX);
     str_push_cstr(&sig_root, keys->access_key_secret);
 
-    /* date key */
-    bool gen_ok = hmac_sha256_from_bytes((const uint8_t*)sig_root.ptr, sig_root.len,
-                                         (const uint8_t*)date_stamp, S3C_DATE_STAMP_SIZE - 1,
-                                         tmp_buf_a);
-    /* date region key */
-    gen_ok = gen_ok && hmac_sha256_from_bytes(tmp_buf_a, S3C_SHA256_BIN_SIZE,
-                                              (const uint8_t*)keys->region,
-                                              strlen(keys->region),
-                                              tmp_buf_b);
-    /* date region service key */
-    gen_ok = gen_ok && hmac_sha256_from_bytes(tmp_buf_b, S3C_SHA256_BIN_SIZE,
-                                              (const uint8_t*)"s3", 2,
-                                              tmp_buf_a);
-    /* final signing key */
-    gen_ok = gen_ok && hmac_sha256_from_bytes(tmp_buf_a, S3C_SHA256_BIN_SIZE,
-                                              (const uint8_t*)S3_REQUEST_TYPE,
-                                              strlen(S3_REQUEST_TYPE),
-                                              out_buf);
+    // date key
+    bool gen_ok = hmac_sha256_from_bytes(
+        (const uint8_t*)sig_root.ptr, sig_root.len,
+        (const uint8_t*)date_stamp, S3C_DATE_STAMP_SIZE - 1,
+        tmp_buf_a
+    );
+    // date region key
+    gen_ok = gen_ok && hmac_sha256_from_bytes(
+        tmp_buf_a, S3C_SHA256_BIN_SIZE,
+        (const uint8_t*)keys->region,
+        strlen(keys->region),
+        tmp_buf_b
+    );
+    // date region service key
+    gen_ok = gen_ok && hmac_sha256_from_bytes(
+        tmp_buf_b, S3C_SHA256_BIN_SIZE,
+        (const uint8_t*)"s3", 2,
+        tmp_buf_a
+    );
+    // final signing key
+    gen_ok = gen_ok && hmac_sha256_from_bytes(
+        tmp_buf_a, S3C_SHA256_BIN_SIZE,
+        (const uint8_t*)S3_REQUEST_TYPE,
+        strlen(S3_REQUEST_TYPE),
+        out_buf
+    );
+
     str_destroy(&sig_root);
 
     return gen_ok;
@@ -650,22 +1041,28 @@ static bool
 gen_string_to_sign(const StrBuf* request_sig, const StrBuf* scope_string,
                    const char* date_time, StrBuf* out_string)
 {
-    char hashed_request_sig[S3C_SHA256_HEX_SIZE];
+    char hashed_request_sig[S3C_SHA256_HEX_SIZE + 1] = {'\0'};
 
-    bool gen_ok = sha256_hex_from_bytes((const uint8_t*)request_sig->ptr,
-                                        request_sig->len,
-                                        hashed_request_sig);
+    bool gen_ok = sha256_hex_from_bytes(
+        (const uint8_t*)request_sig->ptr,
+        request_sig->len,
+        hashed_request_sig
+    );
+
     if (!gen_ok) {
         return false;
     }
 
-    str_set      (out_string, S3_SIGNATURE_ALGO);
-    str_push_char(out_string, '\n');
-    str_push_cstr(out_string, date_time);
-    str_push_char(out_string, '\n');
-    str_push_str (out_string, scope_string);
-    str_push_char(out_string, '\n');
-    str_push     (out_string, hashed_request_sig, S3C_SHA256_HEX_SIZE);
+    str_set(out_string, "");
+
+    str_push_many(
+        out_string,
+        S3_SIGNATURE_ALGO, "\n",
+        date_time, "\n",
+        scope_string->ptr, "\n",
+        hashed_request_sig,
+        NULL
+    );
 
     return true;
 }
@@ -675,45 +1072,47 @@ gen_auth_header(const s3cKeys* keys,
                 const DateStamps* dates,
                 const StrBuf* request_sig,
                 const StrBuf* sig_header_names,
-                StrBuf* out_value)
+                StrBuf* out_header)
 {
     uint8_t signing_key   [S3C_SHA256_BIN_SIZE];
     uint8_t signature_bin [S3C_SHA256_BIN_SIZE];
-    char    signature_hex [S3C_SHA256_HEX_SIZE];
+    char    signature_hex [S3C_SHA256_HEX_SIZE + 1] = {'\0'};
 
     StrBuf scope_string = gen_scope_string(dates->date, keys->region);
 
-    StrBuf* string_to_sign = out_value;
+    str_set(out_header, "");
 
-    bool gen_ok = gen_string_to_sign(request_sig, &scope_string, dates->date_time,
-                                     string_to_sign);
+    bool gen_ok = gen_string_to_sign(
+        request_sig, &scope_string, dates->date_time,
+        out_header
+    );
 
     gen_ok = gen_ok && gen_signing_key(keys, dates->date, signing_key);
 
-    /* sign request string with the signing key */
-    gen_ok = gen_ok && hmac_sha256_from_bytes(signing_key, S3C_SHA256_BIN_SIZE,
-                                             (const uint8_t*)string_to_sign->ptr,
-                                             string_to_sign->len, signature_bin);
+    // sign request string with the signing key
+    gen_ok = gen_ok && hmac_sha256_from_bytes(
+        signing_key, S3C_SHA256_BIN_SIZE,
+        (const uint8_t*)out_header->ptr, out_header->len,
+        signature_bin
+    );
+
     if (!gen_ok) {
         goto cleanup_and_ret;
     }
 
     bytes_to_hex(signature_bin, S3C_SHA256_BIN_SIZE, signature_hex);
 
-    /* build authorization header value */
-    str_set      (out_value, S3_SIGNATURE_ALGO);
-    str_push_cstr(out_value, " Credential=");
-    str_push_cstr(out_value, keys->access_key_id);
-    str_push_char(out_value, '/');
-    str_push_str (out_value, &scope_string);
-    str_push_char(out_value, ',');
+    // build authorization header value
+    str_set(out_header, "");
 
-    str_push_cstr(out_value, " SignedHeaders=");
-    str_push_str (out_value, sig_header_names);
-    str_push_char(out_value, ',');
-
-    str_push_cstr(out_value, " Signature=");
-    str_push     (out_value, signature_hex, S3C_SHA256_HEX_SIZE);
+    str_push_many(
+        out_header,
+        S3_SIGNATURE_ALGO,
+        " Credential=", keys->access_key_id, "/", scope_string.ptr,
+        ", SignedHeaders=", sig_header_names->ptr,
+        ", Signature=", signature_hex,
+        NULL
+    );
 
 cleanup_and_ret:
     str_destroy(&scope_string);
@@ -724,101 +1123,109 @@ cleanup_and_ret:
 static void
 op_run_request(OpContext* op, const char* html_verb)
 {
-    StrBuf request          = {0},
-           request_sig      = str_init(512),
-           sig_headers      = str_init(512),
+    StrBuf request = str_init(128),
+           request_sig = str_init(128),
+           sig_headers = str_init(128),
            sig_header_names = str_init(128),
-           url_path         = str_init(128),
-           aux_buf          = str_init(512),
-           endpoint         = get_req_host(op->keys);
+           auth_header = str_init(128),
+           sig_url = str_init(128),
+           req_url = str_init(128),
+           query_str = str_init(128),
+           endpoint = get_req_host(op->keys);
+
+    s3cKVL* headers = NULL;
 
     DateStamps dates;
     set_date_stamps(&dates);
 
-    s3cHeader* headers = NULL;
-
-    /* don't touch argument headers, copy */
-    for (const s3cHeader* h = op->args.headers; h; h = h->next) {
-        s3c_headers_add(&headers, h->name, h->value);
+    // copy and sort headers
+    for (const s3cKVL* h = op->args.headers; h; h = h->next) {
+        s3c_kvl_ins(&headers, h->key, h->value);
     }
 
-    s3c_headers_upsert(&headers, "host", endpoint.ptr);
-    s3c_headers_upsert(&headers, "x-amz-date", dates.date_time);
+    // asserting query args are sorted
+    for (const s3cKVL* h = op->args.query_args; h; h = h->next) {
+        str_push_many(
+            &query_str, h->key, "=", h->value,
+            (h->next ? "&" : ""),
+            NULL
+        );
+    }
 
-    char content_sha_hex[S3C_SHA256_HEX_SIZE + 1] =
-    /* sha256 hash for empty string */
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\0";
+    s3c_kvl_upsert(&headers, "host", endpoint.ptr);
+    s3c_kvl_upsert(&headers, "x-amz-date", dates.date_time);
+
+    char content_sha_hex[] =
+    // sha256 hash for empty string
+    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
     if (op->args.data) {
         sha256_hex_from_bytes(op->args.data, op->args.data_size, content_sha_hex);
 
-        str_set(&aux_buf, "");
-        str_push_int(&aux_buf, op->args.data_size);
-        s3c_headers_upsert(&headers, "content-length", aux_buf.ptr);
-
-        /* set default ACL if no ACL header was provided */
-        if (s3c_headers_find(headers, S3_HEADER_ACL) == NULL) {
-            s3c_headers_add(&headers, S3_HEADER_ACL, S3_ACL_VALUE_DEFAULT);
-        }
+        s3c_kvl_remove(&headers, "content-length");
+        s3c_kvl_ins_int(&headers, "content-length", op->args.data_size);
     }
 
-    s3c_headers_upsert(&headers, "x-amz-content-sha256", content_sha_hex);
+    s3c_kvl_upsert(&headers, "x-amz-content-sha256", content_sha_hex);
+
+    str_push_char(&sig_url, '/');
+    append_s3_escaped_string(&sig_url, op->args.bucket);
+
+    if (op->args.object_key != NULL) {
+        str_push_char(&sig_url, '/');
+        append_s3_escaped_string(&sig_url, op->args.object_key);
+    }
+
+    str_push_str(&req_url, &sig_url);
+
+    if (query_str.len > 0) {
+        str_push_char(&req_url, '?');
+        str_push_str(&req_url, &query_str);
+    }
 
     gen_sig_header_entries(headers, &sig_headers, &sig_header_names);
 
-    str_push_char(&url_path, '/');
-    append_s3_escaped_string(op->args.bucket, &url_path);
+    // build request signature to sign as per spec
+    str_push_many(
+        &request_sig,
+        html_verb, "\n",
+        sig_url.ptr, "\n",
+        query_str.ptr, "\n",
+        sig_headers.ptr, "\n",
+        sig_header_names.ptr, "\n",
+        content_sha_hex,
+        NULL
+    );
 
-    if (op->args.object_key != NULL) {
-        str_push_char(&url_path, '/');
-        append_s3_escaped_string(op->args.object_key, &url_path);
-    }
+    // create signature for the authorization header
+    bool sig_ok = gen_auth_header(
+        op->keys, &dates,
+        &request_sig, &sig_header_names,
+        &auth_header
+    );
 
-    /* build request signature to sign */
-
-    /* html verb */
-    str_set      (&request_sig, html_verb);
-    str_push_char(&request_sig, '\n');
-    /* canonical URI */
-    str_push_str (&request_sig, &url_path);
-    str_push_char(&request_sig, '\n');
-    /* canonical query string => empty */
-    str_push_char(&request_sig, '\n');
-    /* signed headers */
-    str_push_str (&request_sig, &sig_headers);
-    str_push_char(&request_sig, '\n');
-    /* signed header names */
-    str_push_str (&request_sig, &sig_header_names);
-    str_push_char(&request_sig, '\n');
-    /* payload hash */
-    str_push     (&request_sig, content_sha_hex, S3C_SHA256_HEX_SIZE);
-    /* create signature for the authorization header */
-
-    str_set(&aux_buf, "");
-    bool sig_ok = gen_auth_header(op->keys, &dates,
-                                  &request_sig, &sig_header_names,
-                                  &aux_buf);
     if (!sig_ok) {
         op_set_error(op, "AWS4 signature generation failed => "
                          "hmac sha256 hash gen unsuccessful");
         goto cleanup_and_ret;
     }
 
-    s3c_headers_upsert(&headers, "authorization", aux_buf.ptr);
-    s3c_headers_upsert(&headers, "connection", "close");
+    s3c_kvl_upsert(&headers, "authorization", auth_header.ptr);
+    s3c_kvl_upsert(&headers, "connection", "close");
 
-    str_set      (&request, html_verb);
-    str_push_char(&request, ' ');
-    str_push_str (&request, &url_path);
-    str_push_char(&request, ' ');
-    str_push_cstr(&request, S3_HTTP_VERSION);
-    str_push_cstr(&request, "\r\n");
+    // build http request head
+    str_push_many(
+        &request,
+        html_verb, " ", req_url.ptr, " ", S3_HTTP_VERSION, "\r\n",
+        NULL
+    );
 
-    for (s3cHeader* h = headers; h; h = h->next) {
-        str_push_cstr(&request, h->name);
-        str_push_cstr(&request, ": ");
-        str_push_cstr(&request, h->value);
-        str_push_cstr(&request, "\r\n");
+    for (s3cKVL* h = headers; h; h = h->next) {
+        str_push_many(
+            &request,
+            h->key, ": ", h->value, "\r\n",
+            NULL
+        );
     }
 
     str_push_cstr(&request, "\r\n");
@@ -828,13 +1235,15 @@ op_run_request(OpContext* op, const char* html_verb)
 cleanup_and_ret:
     str_destroy(&request);
     str_destroy(&request_sig);
-    str_destroy(&url_path);
-    str_destroy(&aux_buf);
+    str_destroy(&sig_url);
+    str_destroy(&req_url);
+    str_destroy(&query_str);
     str_destroy(&sig_headers);
     str_destroy(&sig_header_names);
+    str_destroy(&auth_header);
     str_destroy(&endpoint);
 
-    s3c_headers_free(headers);
+    s3c_kvl_free(headers);
 }
 
 static const char*
@@ -912,9 +1321,11 @@ create_socket_bio(const char *host, const char *port, int family)
 {
     BIO_ADDRINFO* bio_addr_info;
 
-    int lk_res = BIO_lookup_ex(host, port, BIO_LOOKUP_CLIENT,
-                               family, SOCK_STREAM, 0,
-                               &bio_addr_info);
+    int lk_res = BIO_lookup_ex(
+        host, port, BIO_LOOKUP_CLIENT,
+        family, SOCK_STREAM, 0,
+        &bio_addr_info
+    );
 
     if (!lk_res || bio_addr_info == NULL) {
         return NULL;
@@ -1047,7 +1458,7 @@ parse_http_resp_code(char* header_line)
 }
 
 static void
-parse_header_line(s3cHeader** headers, char* header_string)
+parse_header_line(s3cKVL** headers, char* header_string)
 {
     char* delim = strstr(header_string, ":");
 
@@ -1065,12 +1476,12 @@ parse_header_line(s3cHeader** headers, char* header_string)
         return;
     }
 
-    s3c_headers_add(headers, name, value);
+    s3c_kvl_ins(headers, name, value);
 }
 
 static const char*
 parse_header_block(char* header_block, size_t header_block_len,
-                   s3cHeader** out_headers, unsigned* out_resp_code)
+                   s3cKVL** out_headers, unsigned* out_resp_code)
 {
     char* str_ptr = header_block;
     size_t len_left = header_block_len;
@@ -1129,8 +1540,10 @@ ossl_io_read(OsslContext* octx, uint8_t* in_buf, size_t in_buf_size,
     int io_res = 0;
 
     errno = 0;
-    io_res = SSL_read_ex(octx->ssl, in_buf, in_buf_size,
-                         out_bytes_recv);
+    io_res = SSL_read_ex(
+        octx->ssl, in_buf, in_buf_size,
+        out_bytes_recv
+    );
 
     const char* err = ossl_proc_io_res(octx, io_res);
 
@@ -1155,8 +1568,10 @@ ossl_io_write(OsslContext* octx, const uint8_t* data,
     int io_res = 0;
 
     errno = 0;
-    io_res = SSL_write_ex(octx->ssl, data, data_size,
-                          out_bytes_sent);
+    io_res = SSL_write_ex(
+        octx->ssl, data, data_size,
+        out_bytes_sent
+    );
 
     const char* err = ossl_proc_io_res(octx, io_res);
 
@@ -1168,9 +1583,9 @@ ossl_io_write(OsslContext* octx, const uint8_t* data,
 }
 
 static int64_t
-parse_reply_content_length(s3cHeader* rep_headers)
+parse_reply_content_length(s3cKVL* rep_headers)
 {
-    s3cHeader* ct_len = s3c_headers_find(rep_headers, "content-length");
+    s3cKVL* ct_len = s3c_kvl_find(rep_headers, "content-length");
 
     if (ct_len == NULL) {
         return -1;
@@ -1198,15 +1613,19 @@ op_read_reply(OpContext* op)
     bool headers_parsed = false;
     unsigned http_resp_code = 0;
 
-    size_t max_mem_prealloc_size = S3C_GLOBAL_CONFS.max_reply_prealloc_size_mb
-                                   * 1024 * 1024;
+    size_t max_mem_prealloc_size =
+        S3C_GLOBAL_CONFS.max_reply_prealloc_size_mb * 1024 * 1024;
+
     for (;;) {
 
         size_t bytes_recv = 0;
 
-        const char* err = ossl_io_read(op->ossl_ctx,
-                                       (uint8_t*)recv_cache.ptr, recv_cache.cap,
-                                       &bytes_recv);
+        const char* err = ossl_io_read(
+            op->ossl_ctx,
+            (uint8_t*)recv_cache.ptr, recv_cache.cap,
+            &bytes_recv
+        );
+
         if (err != NULL) {
             op_set_error_fmt(op, "failed to read http reply: %s", err);
             goto cleanup_and_ret;
@@ -1216,7 +1635,7 @@ op_read_reply(OpContext* op)
             break;
         }
 
-        if (!op->args.fd || !headers_parsed) {
+        if (!op->args.fp || !headers_parsed) {
             size_t num_pushed = str_push(&reply_buf, recv_cache.ptr, bytes_recv);
 
             if (num_pushed < bytes_recv) {
@@ -1225,8 +1644,8 @@ op_read_reply(OpContext* op)
             }
         }
 
-        if (op->args.fd && headers_parsed) {
-            size_t bytes_written = fwrite(recv_cache.ptr, 1, bytes_recv, op->args.fd);
+        if (op->args.fp && headers_parsed) {
+            size_t bytes_written = fwrite(recv_cache.ptr, 1, bytes_recv, op->args.fp);
             if (bytes_written < bytes_recv) {
                 op_set_error(op, "http reply write to file failed");
                 goto cleanup_and_ret;
@@ -1250,10 +1669,12 @@ op_read_reply(OpContext* op)
             goto cleanup_and_ret;
         }
 
-        const char* parse_err = parse_header_block(reply_buf.ptr,
-                                                   block_len,
-                                                   &op->reply->headers,
-                                                   &http_resp_code);
+        const char* parse_err = parse_header_block(
+            reply_buf.ptr, block_len,
+            &op->reply->headers,
+            &http_resp_code
+        );
+
         if (parse_err != NULL) {
             op_set_error(op, parse_err);
             goto cleanup_and_ret;
@@ -1270,9 +1691,9 @@ op_read_reply(OpContext* op)
 
         int64_t rep_len = parse_reply_content_length(op->reply->headers);
 
-        if (op->args.fd) {
+        if (op->args.fp) {
 
-            size_t bytes_written = fwrite(reply_buf.ptr, 1, reply_buf.len, op->args.fd);
+            size_t bytes_written = fwrite(reply_buf.ptr, 1, reply_buf.len, op->args.fp);
             if (bytes_written < reply_buf.len) {
                 op_set_error(op, "http reply write to file failed");
                 goto cleanup_and_ret;
@@ -1283,7 +1704,8 @@ op_read_reply(OpContext* op)
 
             if (str_set_cap(&reply_buf, rep_len) < (size_t)rep_len) {
                 op_set_error_fmt(
-                    op, "http reply allocation failed, content-length: [%zu]", (size_t)rep_len
+                    op, "http reply allocation failed, content-length: [%zu]",
+                    (size_t)rep_len
                 );
                 goto cleanup_and_ret;
             }
@@ -1312,9 +1734,12 @@ op_send_request(OpContext* op, StrBuf* rq_head)
     }
 
     size_t bytes_sent_now;
-    const char* io_err = ossl_io_write(op->ossl_ctx,
-                                      (const uint8_t*)rq_head->ptr, rq_head->len,
-                                      &bytes_sent_now);
+    const char* io_err = ossl_io_write(
+        op->ossl_ctx,
+        (const uint8_t*)rq_head->ptr, rq_head->len,
+        &bytes_sent_now
+    );
+
     if (io_err != NULL) {
         op_set_error_fmt(op, "failed to send http request: %s", io_err);
         goto cleanup_and_ret;
@@ -1337,10 +1762,12 @@ op_send_request(OpContext* op, StrBuf* rq_head)
 
         size_t bytes_left = data_size - bytes_sent_total;
 
-        io_err = ossl_io_write(op->ossl_ctx,
-                               data + bytes_sent_total,
-                               bytes_left,
-                               &bytes_sent_now);
+        io_err = ossl_io_write(
+            op->ossl_ctx,
+            data + bytes_sent_total,
+            bytes_left,
+            &bytes_sent_now
+        );
 
         if (io_err != NULL) {
             op_set_error_fmt(op, "failed to send http request: %s", io_err);
@@ -1357,28 +1784,6 @@ cleanup_and_ret:
 }
 
 static void
-parse_error_reply(const char* reply, StrBuf* out_buf)
-{
-    const char* MSG_START_TAG = "<Message>";
-    const char* MSG_END_TAG = "</Message>";
-
-    const char* msg_start = strstr(reply, MSG_START_TAG);
-    const char* msg_end = strstr(reply, MSG_END_TAG);
-
-    if (msg_start == NULL || msg_end == NULL ||
-        msg_end <= msg_start + strlen(MSG_START_TAG)) {
-
-        str_set(out_buf, "");
-        return;
-    }
-
-    msg_start += strlen(MSG_START_TAG);
-    ptrdiff_t diff = msg_end - msg_start;
-
-    str_push(out_buf, msg_start, diff);
-}
-
-static void
 op_proc_reply(OpContext* op, StrBuf* reply, unsigned http_resp_code)
 {
     if (!op->ok) {
@@ -1389,7 +1794,7 @@ op_proc_reply(OpContext* op, StrBuf* reply, unsigned http_resp_code)
 
     if (http_resp_code < 300 && http_resp_code > 199) {
 
-        if (reply->len > 0 && !op->args.fd) {
+        if (reply->len > 0 && !op->args.fp) {
             op->reply->data_size = reply->len;
             op->reply->data = (uint8_t*)str_extract(reply);
         }
@@ -1403,7 +1808,7 @@ op_proc_reply(OpContext* op, StrBuf* reply, unsigned http_resp_code)
 
     if (reply->len > 0) {
         str_push_cstr(&err_buf, ": ");
-        parse_error_reply(reply->ptr, &err_buf);
+        parse_xml_tag(reply->ptr, "Message", &err_buf);
     }
 
     op_set_error(op, err_buf.ptr);
@@ -1427,27 +1832,27 @@ cmp_no_case(char const *a, char const *b)
 }
 
 void
-s3c_headers_add_int(s3cHeader** head, const char* name, int64_t int_value)
+s3c_kvl_ins_int(s3cKVL** head_ref, const char* name, int64_t int_value)
 {
     StrBuf sbuf = str_init(20);
     str_push_int(&sbuf, int_value);
 
-    s3c_headers_add(head, name, sbuf.ptr);
+    s3c_kvl_ins(head_ref, name, sbuf.ptr);
 
     str_destroy(&sbuf);
 }
 
 void
-s3c_headers_add(s3cHeader** head, const char* name, const char* value)
+s3c_kvl_ins(s3cKVL** head_ref, const char* name, const char* value)
 {
-    s3cHeader* cur = *head;
-    s3cHeader* prev = NULL;
+    s3cKVL* cur = *head_ref;
+    s3cKVL* prev = NULL;
 
     int order_diff = -1;
 
     while (cur != NULL) {
 
-        order_diff = cmp_no_case(name, cur->name);
+        order_diff = cmp_no_case(name, cur->key);
 
         if (order_diff <= 0) {
             break;
@@ -1457,11 +1862,12 @@ s3c_headers_add(s3cHeader** head, const char* name, const char* value)
         cur = cur->next;
     }
 
-    /* append value to existing header */
+    // append value to existing head_refer
     if (order_diff == 0) {
 
-        StrBuf sbuf = str_init(strlen(value) +
-                                strlen(cur->value) + 2);
+        StrBuf sbuf = str_init(
+            strlen(value) + strlen(cur->value) + 2
+        );
 
         str_set      (&sbuf, cur->value);
         str_push_cstr(&sbuf, ", ");
@@ -1473,26 +1879,26 @@ s3c_headers_add(s3cHeader** head, const char* name, const char* value)
         return;
     }
 
-    s3cHeader* new_node = malloc(sizeof(s3cHeader));
+    s3cKVL* new_node = malloc(sizeof(s3cKVL));
 
-    new_node->name  = str_dup(name);
+    new_node->key = str_dup(name);
     new_node->value = str_dup(value);
     new_node->next  = NULL;
 
-    if (*head == NULL) {
-        *head = new_node;
+    if (*head_ref == NULL) {
+        *head_ref = new_node;
         return;
     }
 
-    assert(prev != NULL || (cur == *head && order_diff < 0));
+    assert(prev != NULL || (cur == *head_ref && order_diff < 0));
 
     if (order_diff < 0) {
-        /* prepend */
+        // prepend
         new_node->next = cur;
 
-        if (cur == *head) {
-            /* set new head */
-            *head = new_node;
+        if (cur == *head_ref) {
+            // set new head_ref
+            *head_ref = new_node;
             return;
         }
 
@@ -1500,43 +1906,41 @@ s3c_headers_add(s3cHeader** head, const char* name, const char* value)
         prev->next = new_node;
 
     } else {
-        /* append */
+        // append
         new_node->next = prev->next;
         prev->next = new_node;
     }
 }
 
-s3cHeader*
-s3c_headers_find(s3cHeader* head, const char* name)
+s3cKVL*
+s3c_kvl_find(s3cKVL* head_ref, const char* name)
 {
-    for (; head != NULL; head = head->next) {
-        if (cmp_no_case(name, head->name) == 0) {
-            return head;
+    for (; head_ref != NULL; head_ref = head_ref->next) {
+        if (cmp_no_case(name, head_ref->key) == 0) {
+            return head_ref;
         }
     }
-
     return NULL;
 }
 
 void
-s3c_headers_remove(s3cHeader** head, const char* name)
+s3c_kvl_remove(s3cKVL** head_ref, const char* name)
 {
-    s3cHeader* prev = NULL;
-    s3cHeader* cur = *head;
+    s3cKVL* prev = NULL;
+    s3cKVL* cur = *head_ref;
 
     for (; cur != NULL; prev = cur, cur = cur->next) {
+        if (cmp_no_case(name, cur->key) == 0) {
 
-        if (cmp_no_case(name, cur->name) == 0) {
-
-            if (cur == *head) {
-                *head = cur->next;
+            if (cur == *head_ref) {
+                *head_ref = cur->next;
 
             } else if (prev != NULL) {
                 prev->next = cur->next;
             }
 
             cur->next = NULL;
-            s3c_headers_free(cur);
+            s3c_kvl_free(cur);
 
             break;
         }
@@ -1544,28 +1948,28 @@ s3c_headers_remove(s3cHeader** head, const char* name)
 }
 
 static void
-s3c_headers_upsert(s3cHeader** head, const char* name, const char* value)
+s3c_kvl_upsert(s3cKVL** head, const char* name, const char* value)
 {
-    s3cHeader* h = s3c_headers_find(*head, name);
+    s3cKVL* h = s3c_kvl_find(*head, name);
 
     if (h != NULL) {
         free(h->value);
         h->value = str_dup(value);
     } else {
-        s3c_headers_add(head, name, value);
+        s3c_kvl_ins(head, name, value);
     }
 }
 
 void
-s3c_headers_free(s3cHeader* head)
+s3c_kvl_free(s3cKVL* head)
 {
     while (head != NULL) {
-        s3cHeader* next = head->next;
+        s3cKVL* next = head->next;
 
-        free(head->name);
+        free(head->key);
         free(head->value);
 
-        memset(head, 0, sizeof(s3cHeader));
+        memset(head, 0, sizeof(s3cKVL));
         free(head);
 
         head = next;
@@ -1626,11 +2030,11 @@ str_set_cap(StrBuf* s, size_t cap)
 static size_t
 str_push(StrBuf* s, const char* a, size_t a_len)
 {
-    if (a_len < 1) {
+    if (s->ptr != NULL && a_len < 1) {
         return 0;
     }
 
-    if (s->len + a_len > s->cap) {
+    if (s->cap < 1 || s->len + a_len > s->cap) {
 
         if (s->cap < 1) {
             s->cap = 64;
@@ -1683,6 +2087,23 @@ static size_t
 str_push_cstr(StrBuf* s, const char* a)
 {
     return str_push(s, a, strlen(a));
+}
+
+static size_t
+str_push_many(StrBuf* s, ...)
+{
+    va_list cstrs;
+    va_start(cstrs, s);
+
+    size_t bytes_pushed = 0;
+    const char* a;
+
+    while ((a = va_arg(cstrs, const char*)) != NULL) {
+        bytes_pushed += str_push(s, a, strlen(a));
+    }
+
+    va_end(cstrs);
+    return bytes_pushed;
 }
 
 static size_t
