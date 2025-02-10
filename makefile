@@ -30,8 +30,10 @@ print:
 
 static: print $(lib).a
 
-tests: print $(lib).a $(test_objs)
+$(out_dir)/tests: $(lib).a $(test_objs)
 	@$(CC) $(CCFLAGS) -o $(out_dir)/tests $(test_objs) $(lib).a $(link_libs)
+
+tests: print $(out_dir)/tests
 	@echo "running tests..."
 	@if [ $(valgrind_on) = 1 ];\
 	then\

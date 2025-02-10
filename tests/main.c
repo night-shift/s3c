@@ -13,8 +13,7 @@ const char* TEST_BUCKET = "s3c-tests";
 const char* LOCAL_OBJ_FILE = "tests/obj_file";
 
 
-void
-log_info(const char* fmt_str, ...)
+void log_info(const char* fmt_str, ...)
 {
     va_list args;
     va_start(args, fmt_str);
@@ -25,8 +24,7 @@ log_info(const char* fmt_str, ...)
     va_end(args);
 }
 
-void
-log_err(const char* fmt_str, ...)
+void log_err(const char* fmt_str, ...)
 {
     printf("\033[31m");
 
@@ -41,8 +39,7 @@ log_err(const char* fmt_str, ...)
     fflush(stdout);
 }
 
-void
-read_file(const char* filename, char** out_filebuf, size_t* out_file_size)
+void read_file(const char* filename, char** out_filebuf, size_t* out_file_size)
 {
     FILE* fp = fopen(filename, "rb");
 
@@ -70,8 +67,7 @@ read_file(const char* filename, char** out_filebuf, size_t* out_file_size)
     fclose(fp);
 }
 
-const char*
-read_s3c_keys_file(const char* filename, s3cKeys* keys)
+const char* read_s3c_keys_file(const char* filename, s3cKeys* keys)
 {
     const char* err = NULL;
 
@@ -137,8 +133,7 @@ cleanup_and_ret:
     return err;
 }
 
-bool
-create_test_bucket(const s3cKeys* keys)
+bool create_test_bucket(const s3cKeys* keys)
 {
     bool ok = true;
 
@@ -153,8 +148,7 @@ create_test_bucket(const s3cKeys* keys)
     return ok;
 }
 
-bool
-delete_test_bucket(const s3cKeys* keys)
+bool delete_test_bucket(const s3cKeys* keys)
 {
     s3cReply* reply = s3c_delete_bucket(keys, TEST_BUCKET);
     bool ok = reply->error != NULL;
@@ -163,11 +157,10 @@ delete_test_bucket(const s3cKeys* keys)
     return ok;
 }
 
-bool
-fetch_and_compare_file(const s3cKeys* keys,
-                       const char* obj_key,
-                       const char* source, size_t source_sz,
-                       const char* source_ct)
+bool fetch_and_compare_file(const s3cKeys* keys,
+                            const char* obj_key,
+                            const char* source, size_t source_sz,
+                            const char* source_ct)
 {
     bool ok = false;
     char* fetched = NULL;
@@ -222,10 +215,9 @@ cleanup_and_ret:
     return ok;
 }
 
-bool
-put_big_object(const s3cKeys* keys)
+bool test_big_object(const s3cKeys* keys)
 {
-    size_t rt_data_size = 1024 * 1024 * 25;
+    size_t rt_data_size = 1024 * 1024 * 25 + 7;
     const char* object_key = "big-file";
     const char* rt_content_type = "application/binary";
     char* filebuf = NULL;
@@ -238,7 +230,7 @@ put_big_object(const s3cKeys* keys)
 
     create_test_bucket(keys);
 
-    bool ok = false;
+    bool all_good = false;
     char* rt_data = calloc(rt_data_size, 1);
 
     for (unsigned i = 0; i < rt_data_size; i++) {
@@ -247,15 +239,35 @@ put_big_object(const s3cKeys* keys)
 
     log_info("put big object...");
 
-    s3cReply* reply = s3c_put_object(keys, TEST_BUCKET, object_key,
-                                    (const uint8_t*)rt_data, rt_data_size,
-                                    &ct_header);
+    s3cReply* reply = s3c_put_object(
+        keys, TEST_BUCKET, object_key,
+        (const uint8_t*)rt_data, rt_data_size, &ct_header
+    );
+
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
         goto cleanup_and_ret;
     }
 
     log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    s3c_reply_free(reply);
+    log_info("get big object...");
+
+    reply = s3c_get_object(keys, TEST_BUCKET, object_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->data_size != rt_data_size ||
+        memcmp(rt_data, reply->data, reply->data_size) != 0) {
+        log_err("error: reply payload did not match original payload\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
 
     log_info("get big object to file...");
 
@@ -271,12 +283,13 @@ put_big_object(const s3cKeys* keys)
 
     log_info("ok\n");
 
-    log_info("put big object from file multipart...");
+    log_info("put big object from file...");
 
     s3c_reply_free(reply);
 
-    reply = s3c_put_object_from_file(keys, TEST_BUCKET, object_key,
-                                     LOCAL_OBJ_FILE, &ct_header);
+    reply = s3c_put_object_from_file(
+        keys, TEST_BUCKET, object_key, LOCAL_OBJ_FILE, &ct_header
+    );
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -285,7 +298,7 @@ put_big_object(const s3cKeys* keys)
 
     log_info("ok resp code => %d\n", (int)reply->http_resp_code);
 
-    log_info("fetch big object from file after multipart...");
+    log_info("fetch and compare big object...");
     fetch_cmp_ok = fetch_and_compare_file(
         keys, object_key,
         rt_data, rt_data_size,
@@ -298,10 +311,39 @@ put_big_object(const s3cKeys* keys)
 
     log_info("ok\n");
 
-    ok = true;
+    log_info("put big object from file multipart...");
+
+    s3c_reply_free(reply);
+
+    reply = s3c_put_object_from_file_multipart(
+        keys, TEST_BUCKET, object_key, LOCAL_OBJ_FILE,
+        &ct_header, NULL
+    );
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    log_info("fetch and compare big object after multipart...");
+
+    fetch_cmp_ok = fetch_and_compare_file(
+        keys, object_key,
+        rt_data, rt_data_size,
+        rt_content_type
+    );
+
+    if (!fetch_cmp_ok) {
+        goto cleanup_and_ret;
+    };
+
+    log_info("ok\n");
+
+    all_good = true;
 
 cleanup_and_ret:
-
     s3c_reply_free(reply);
     reply = s3c_delete_object(keys, TEST_BUCKET, object_key);
     s3c_reply_free(reply);
@@ -312,11 +354,10 @@ cleanup_and_ret:
     remove(LOCAL_OBJ_FILE);
     delete_test_bucket(keys);
 
-    return ok;
+    return all_good;
 }
 
-bool
-run_basic_tests(const s3cKeys* keys)
+bool run_basic_tests(const s3cKeys* keys)
 {
     s3cReply* reply = NULL;
     s3cKVL* headers = NULL;
@@ -326,6 +367,7 @@ run_basic_tests(const s3cKeys* keys)
     log_info("create bucket...");
 
     reply = s3c_create_bucket(keys, TEST_BUCKET, NULL);
+
     if (reply->error != NULL && reply->http_resp_code != 409) {
         log_err("error: %s\n", reply->error);
         goto cleanup_and_ret;
@@ -343,8 +385,7 @@ run_basic_tests(const s3cKeys* keys)
     s3c_reply_free(reply);
 
     reply = s3c_put_object(
-        keys,
-        TEST_BUCKET, object_key,
+        keys, TEST_BUCKET, object_key,
         (const uint8_t*)rt_data, rt_data_size,
         headers
     );
@@ -402,9 +443,7 @@ run_basic_tests(const s3cKeys* keys)
     s3c_reply_free(reply);
 
     reply = s3c_put_object_from_file(
-       keys,
-       TEST_BUCKET, object_key,
-       LOCAL_OBJ_FILE,
+       keys, TEST_BUCKET, object_key, LOCAL_OBJ_FILE,
        headers
     );
 
@@ -417,6 +456,7 @@ run_basic_tests(const s3cKeys* keys)
 
     log_info("delete object...");
     s3c_reply_free(reply);
+
     reply = s3c_delete_object(keys, TEST_BUCKET, object_key);
 
     if (reply->error != NULL) {
@@ -427,6 +467,7 @@ run_basic_tests(const s3cKeys* keys)
 
 
     log_info("confirm object was deleted...");
+
     s3c_reply_free(reply);
     reply = s3c_get_object(keys, TEST_BUCKET, object_key);
 
@@ -453,10 +494,7 @@ cleanup_and_ret:
     s3c_reply_free(reply);
     s3c_kvl_free(headers);
 
-    if (filebuf != NULL) {
-        free(filebuf);
-    }
-
+    free(filebuf);
     remove(LOCAL_OBJ_FILE);
 
     return all_good;
@@ -487,13 +525,12 @@ int main(int argc, const char** argv)
         ret_code = 1;
     }
 
-    ok = put_big_object(&keys);
+    ok = test_big_object(&keys);
     if (!ok) {
         ret_code = 1;
     }
 
 cleanup_and_ret:
-
     if (ret_code == 0) {
         log_info("=> tests passed\n");
     } else {
