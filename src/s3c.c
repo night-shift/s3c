@@ -404,11 +404,11 @@ s3cReply* s3c_get_object_to_file(const s3cKeys* keys,
         return err;
     }
 
-    bool file_is_new = false;
+    bool file_is_new = true;
     FILE* fp = fopen(file, "r");
 
     if (fp != NULL) {
-        file_is_new = true;
+        file_is_new = false;
         fclose(fp);
     }
 
@@ -434,7 +434,6 @@ s3cReply* s3c_get_object_to_file(const s3cKeys* keys,
 
     s3cReply* res = run_s3_op(keys, "GET", args);
 
-    // remove file on error unless it was not newly created
     if (res->error != NULL && file_is_new) {
         remove(file);
     }
@@ -827,7 +826,8 @@ cleanup_and_ret:
 s3cReply* s3c_put_object_from_file_multipart(const s3cKeys* keys,
                                              const char* bucket, const char* object_key,
                                              const char* file,
-                                             const s3cKVL* headers, s3cMultipartOpts* opts)
+                                             const s3cKVL* headers,
+                                             const s3cMultipartOpts* opts)
 {
     s3cMultipartOpts default_opts = {
         .part_size = 6 * 1024 * 1024,

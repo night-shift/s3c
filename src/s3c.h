@@ -60,7 +60,8 @@ typedef struct {
 s3cReply* s3c_put_object_from_file_multipart(const s3cKeys* keys,
                                              const char* bucket, const char* object_key,
                                              const char* file,
-                                             const s3cKVL* headers, s3cMultipartOpts* opts);
+                                             const s3cKVL* headers,
+                                             const s3cMultipartOpts* opts);
 
 
 s3cReply* s3c_delete_object(const s3cKeys* keys, const char* bucket, const char* object_key);
