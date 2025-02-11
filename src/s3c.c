@@ -247,7 +247,8 @@ cleanup_and_ret:
     return reply;
 }
 
-const char* fn_stream_write_str_buf(const char* bytes, size_t num_bytes, StreamContext* c)
+static const char* fn_stream_write_str_buf(const char* bytes, size_t num_bytes,
+                                           StreamContext* c)
 {
     StrBuf* str_buf = c->opaque;
 
@@ -270,7 +271,8 @@ const char* fn_stream_write_str_buf(const char* bytes, size_t num_bytes, StreamC
     return NULL;
 }
 
-const char* fn_stream_write_file(const char* bytes, size_t num_bytes, StreamContext* c)
+static const char* fn_stream_write_file(const char* bytes, size_t num_bytes,
+                                        StreamContext* c)
 {
     FILE* fp = c->opaque;
     size_t bytes_written = fwrite(bytes, 1, num_bytes, fp);
@@ -282,8 +284,8 @@ const char* fn_stream_write_file(const char* bytes, size_t num_bytes, StreamCont
     return NULL;
 }
 
-const char* fn_stream_read_mem(size_t read_num_bytes, StreamContext* c,
-                               const char** out_ptr, size_t* out_num_bytes)
+static const char* fn_stream_read_mem(size_t read_num_bytes, StreamContext* c,
+                                      const char** out_ptr, size_t* out_num_bytes)
 {
     const char* mem = c->opaque;
 
@@ -304,8 +306,8 @@ const char* fn_stream_read_mem(size_t read_num_bytes, StreamContext* c,
 }
 
 
-const char* fn_stream_read_file(size_t read_num_bytes, StreamContext* c,
-                                const char** out_ptr, size_t* out_num_bytes)
+static const char* fn_stream_read_file(size_t read_num_bytes, StreamContext* c,
+                                       const char** out_ptr, size_t* out_num_bytes)
 {
     BufferedFile* bf = c->opaque;
 
@@ -1554,7 +1556,7 @@ static void ossl_free(OsslContext* octx)
     free(octx);
 }
 
-const char* ossl_proc_io_res(OsslContext* octx, int io_res)
+static const char* ossl_proc_io_res(OsslContext* octx, int io_res)
 {
     if (io_res == 1) {
         return NULL;
