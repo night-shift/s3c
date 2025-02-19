@@ -1580,17 +1580,17 @@ static const char* ossl_proc_io_res(OsslContext* octx, int io_res)
     return  "unknown net error occured";
 }
 
-static BIO* create_socket_bio(const char *host, const char *port, int family)
+static BIO* create_socket_bio(const char *host, const char *proto)
 {
     BIO_ADDRINFO* bio_addr_info;
 
     int lk_res = BIO_lookup_ex(
-        host, port, BIO_LOOKUP_CLIENT,
-        family, SOCK_STREAM, 0,
+        host, proto, BIO_LOOKUP_CLIENT,
+        AF_UNSPEC, SOCK_STREAM, 0,
         &bio_addr_info
     );
 
-    if (!lk_res || bio_addr_info == NULL) {
+    if (lk_res == 0 || bio_addr_info == NULL) {
         return NULL;
     }
 
@@ -1649,11 +1649,7 @@ static BIO* create_socket_bio(const char *host, const char *port, int family)
 
 static const char* ossl_connect(OsslContext* octx, const char* host)
 {
-    BIO* bio = create_socket_bio(host, "443", AF_INET);
-
-    if (bio == NULL) {
-        bio = create_socket_bio(host, "443", AF_INET6);
-    }
+    BIO* bio = create_socket_bio(host, "https");
 
     if (bio == NULL) {
         return "failed to resolve host";

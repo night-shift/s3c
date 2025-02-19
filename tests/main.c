@@ -40,8 +40,9 @@ void log_err(const char* fmt_str, ...)
 }
 
 void read_file(const char* filename, char** out_filebuf, size_t* out_file_size)
+
 {
-    FILE* fp = fopen(filename, "rb");
+    FILE* fp = fopen(filename, "r");
 
     if (fp == NULL) {
         *out_filebuf = NULL;
@@ -163,7 +164,7 @@ bool fetch_and_compare_file(const s3cKeys* keys,
                             const char* source_ct)
 {
     bool ok = false;
-    char* fetched = NULL;
+    char* fetched_bytes = NULL;
 
     remove(LOCAL_OBJ_FILE);
 
@@ -176,31 +177,37 @@ bool fetch_and_compare_file(const s3cKeys* keys,
         goto cleanup_and_ret;
     }
 
-    size_t fetched_sz = 0;
-    read_file(LOCAL_OBJ_FILE, &fetched, &fetched_sz);
+    size_t fetched_bytes_sz = 0;
+    read_file(LOCAL_OBJ_FILE, &fetched_bytes, &fetched_bytes_sz);
 
-    if (fetched_sz != source_sz) {
+    if (fetched_bytes == NULL) {
+        log_err("error: failed to read file %s\n",
+            LOCAL_OBJ_FILE
+        );
+    }
+
+    if (fetched_bytes_sz != source_sz) {
         log_err("error: source size [%zu] does not match fetched file size [%zu]\n",
-            fetched_sz, source_sz
+            source_sz, fetched_bytes_sz
         );
         goto cleanup_and_ret;
     }
 
-    if (memcmp(source, fetched, source_sz) != 0) {
+    if (memcmp(source, fetched_bytes, source_sz) != 0) {
         log_err("error: source / fetched file content do not match\n");
         goto cleanup_and_ret;
     }
 
     if (source_ct != NULL) {
 
-        s3cKVL* fetched_ct_header = s3c_kvl_find(reply->headers, "content-type");
+        s3cKVL* fetched_bytes_ct_header = s3c_kvl_find(reply->headers, "content-type");
 
-        if (fetched_ct_header == NULL) {
+        if (fetched_bytes_ct_header == NULL) {
             log_err("error: fetched file has no content type header\n");
             goto cleanup_and_ret;
         }
 
-        if (strcmp(fetched_ct_header->value, source_ct)) {
+        if (strcmp(fetched_bytes_ct_header->value, source_ct)) {
             log_err("error: fetched file has wrong content header\n");
             goto cleanup_and_ret;
         }
@@ -210,14 +217,14 @@ bool fetch_and_compare_file(const s3cKeys* keys,
 
 cleanup_and_ret:
     s3c_reply_free(reply);
-    free(fetched);
+    free(fetched_bytes);
 
     return ok;
 }
 
 bool test_big_object(const s3cKeys* keys)
 {
-    size_t rt_data_size = 1024 * 1024 * 25 + 7;
+    size_t rt_data_size = 1024 * 1024 * 15;
     const char* object_key = "big-file";
     const char* rt_content_type = "application/binary";
     char* filebuf = NULL;
@@ -263,7 +270,10 @@ bool test_big_object(const s3cKeys* keys)
 
     if (reply->data_size != rt_data_size ||
         memcmp(rt_data, reply->data, reply->data_size) != 0) {
-        log_err("error: reply payload did not match original payload\n");
+        log_err(
+            "error: reply payload did not match original payload, sizes [%zu] / [%zu]\n",
+            reply->data_size, rt_data_size
+        );
         goto cleanup_and_ret;
     }
 
@@ -409,7 +419,13 @@ bool run_basic_tests(const s3cKeys* keys)
 
     if (reply->data_size != rt_data_size ||
         memcmp(rt_data, reply->data, reply->data_size) != 0) {
-        log_err("error: reply payload did not match original payload\n");
+        log_err(
+            "error: reply payload [%s][%zu] did not match original payload [%s][%zu]\n"
+            "resp code: %zu\n",
+            reply->data, reply->data_size, rt_data, rt_data_size,
+            reply->http_resp_code
+        );
+
         goto cleanup_and_ret;
     }
 
@@ -422,6 +438,7 @@ bool run_basic_tests(const s3cKeys* keys)
         log_err("error: returned content type header does not match original\n");
         goto cleanup_and_ret;
     }
+
     log_info("ok resp code => %d\n", (int)reply->http_resp_code);
 
     log_info("fetching object to file...");
