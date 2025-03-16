@@ -777,6 +777,7 @@ s3cReply* s3c_put_object_from_file(const s3cKeys* keys,
     }
 
     s3cReply* reply = NULL;
+    StrBuf read_buf = {0};
 
     FILE* fp = fopen(file, "r");
 
@@ -784,8 +785,6 @@ s3cReply* s3c_put_object_from_file(const s3cKeys* keys,
         reply = s3c_reply_alloc("failed to open file for read");
         goto cleanup_and_ret;
     }
-
-    StrBuf read_buf = {0};
 
     BufferedFile bf = {
         .buf = &read_buf,
@@ -2119,7 +2118,7 @@ void s3c_kvl_ins(s3cKVL** head_ref, const char* name, const char* value)
         cur = cur->next;
     }
 
-    // append value to existing head_refer
+    // append value to existing header
     if (order_diff == 0) {
 
         StrBuf sbuf = str_init(
