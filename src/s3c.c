@@ -1515,12 +1515,8 @@ static const char* ossl_init(OsslContext* octx)
         return "openssl failed to allocate ssl context";
     }
 
-    octx->ssl = SSL_new(octx->ssl_ctx);
-
-    if (octx->ssl == NULL) {
-        return "openssl failed to allocate ssl object";
-    }
-
+    // Configure CTX before SSL_new: SSL_new copies verify_mode from the CTX
+    // at creation time, so these must be set before the SSL object is created.
     SSL_CTX_set_verify(octx->ssl_ctx, SSL_VERIFY_PEER, NULL);
 
     if (!SSL_CTX_set_default_verify_paths(octx->ssl_ctx)) {
@@ -1529,6 +1525,12 @@ static const char* ossl_init(OsslContext* octx)
 
     if (!SSL_CTX_set_min_proto_version(octx->ssl_ctx, TLS1_2_VERSION)) {
         return "openssl failed to set the minimum TLS protocol version";
+    }
+
+    octx->ssl = SSL_new(octx->ssl_ctx);
+
+    if (octx->ssl == NULL) {
+        return "openssl failed to allocate ssl object";
     }
 
     SSL_set_mode(octx->ssl, SSL_MODE_AUTO_RETRY);
@@ -1542,13 +1544,8 @@ static void ossl_free(OsslContext* octx)
         return;
     }
 
-    if (octx->ssl != NULL) {
-        int socket_fd = SSL_get_fd(octx->ssl);
-        if (socket_fd >= 0) {
-            BIO_closesocket(socket_fd);
-        }
-    }
-
+    // SSL_free frees the BIO chain; since the BIO was created with BIO_CLOSE
+    // the socket fd is closed as part of that — no manual close needed here.
     SSL_free(octx->ssl);
     SSL_CTX_free(octx->ssl_ctx);
 
@@ -1776,7 +1773,7 @@ static const char* parse_header_block(char* header_block, size_t header_block_le
         }
 
         str_ptr += line_len + 1;
-        len_left -= line_len;
+        len_left -= line_len + 1;
     }
 
     if (!first_line_parsed) {

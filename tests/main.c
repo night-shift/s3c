@@ -152,7 +152,8 @@ bool create_test_bucket(const s3cKeys* keys)
 bool delete_test_bucket(const s3cKeys* keys)
 {
     s3cReply* reply = s3c_delete_bucket(keys, TEST_BUCKET);
-    bool ok = reply->error != NULL;
+
+    bool ok = reply->error == NULL;
     s3c_reply_free(reply);
 
     return ok;
