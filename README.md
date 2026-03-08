@@ -1,4 +1,6 @@
 ### Basic AWS S3 library in C
+All operations run through a reusable `s3cClient*`.
+
 ```c
 #include "../src/s3c.h"
 
@@ -34,8 +36,18 @@ int main(int argc, char** argv)
         s3_bucket = argv[5];
     }
 
+    s3cReply* client_err = NULL;
+    s3cClient* client = s3c_client_new(&keys, NULL, &client_err);
+
+    if (client == NULL) {
+        printf("s3c_client_new failed with error => %s\n",
+               client_err != NULL ? client_err->error : "failed to initialize client");
+        s3c_reply_free(client_err);
+        return 1;
+    }
+
     // First, create the bucket
-    s3cReply* reply = s3c_create_bucket(&keys, s3_bucket, NULL);
+    s3cReply* reply = s3c_create_bucket(client, s3_bucket, NULL);
 
     // An error will be returned if the bucket already exists
     if (reply->error != NULL) {
@@ -54,8 +66,8 @@ int main(int argc, char** argv)
 
     // Put object with key "fruits.txt"
     // any such object within the bucket will be overwritten
-    reply = s3c_put_object(&keys, s3_bucket, object_key,
-                          (const uint8_t*)content, strlen(content),
+    reply = s3c_put_object(client, s3_bucket, object_key,
+                           (const uint8_t*)content, strlen(content),
                            NULL);
 
     if (reply->error != NULL) {
@@ -73,7 +85,7 @@ int main(int argc, char** argv)
     s3cKVL ct_header  = { "content-type", "text/plain", NULL };
     s3cKVL acl_header = { "x-amzn-acl", "bucket-owner-full-control", &ct_header };
 
-    reply = s3c_put_object(&keys, s3_bucket, object_key,
+    reply = s3c_put_object(client, s3_bucket, object_key,
                            (const uint8_t*)content, strlen(content),
                            &acl_header);
 
@@ -84,7 +96,7 @@ int main(int argc, char** argv)
     s3c_reply_free(reply);
 
     // Get fruits.txt
-    reply = s3c_get_object(&keys, s3_bucket, object_key);
+    reply = s3c_get_object(client, s3_bucket, object_key);
 
     if (reply->error != NULL) {
         printf("s3c_get_object failed with error => %s\n", reply->error);
@@ -105,7 +117,7 @@ int main(int argc, char** argv)
     s3c_reply_free(reply);
 
     // Delete fruits.txt
-    reply = s3c_delete_object(&keys, s3_bucket, object_key);
+    reply = s3c_delete_object(client, s3_bucket, object_key);
 
     if (reply->error != NULL) {
         printf("s3c_delete_object failed with error => %s\n", reply->error);
@@ -116,7 +128,7 @@ int main(int argc, char** argv)
     s3c_reply_free(reply);
 
     // Delete the bucket, this will fail if bucket is not empty
-    reply = s3c_delete_bucket(&keys, s3_bucket);
+    reply = s3c_delete_bucket(client, s3_bucket);
 
     if (reply->error != NULL) {
         printf("s3c_delete_bucket failed with error => %s\n", reply->error);
@@ -125,6 +137,7 @@ int main(int argc, char** argv)
     }
 
     s3c_reply_free(reply);
+    s3c_client_free(client);
 
     return 0;
 }
@@ -132,7 +145,6 @@ int main(int argc, char** argv)
 
 ### Dependencies
 compile with -lssl -lcrypto
-
 
 
 

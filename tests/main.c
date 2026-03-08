@@ -134,11 +134,271 @@ cleanup_and_ret:
     return err;
 }
 
-bool create_test_bucket(const s3cKeys* keys)
+bool expect_error_reply(const char* test_name, s3cReply* reply, const char* error_substr)
 {
     bool ok = true;
 
-    s3cReply* reply = s3c_create_bucket(keys, TEST_BUCKET, NULL);
+    if (reply == NULL) {
+        log_err("error: %s - reply is NULL\n", test_name);
+        return false;
+    }
+
+    if (reply->error == NULL) {
+        log_err("error: %s - expected reply->error\n", test_name);
+        ok = false;
+        goto cleanup_and_ret;
+    }
+
+    if (error_substr != NULL && strstr(reply->error, error_substr) == NULL) {
+        log_err("error: %s - reply error '%s' missing expected token '%s'\n",
+                test_name, reply->error, error_substr);
+        ok = false;
+    }
+
+cleanup_and_ret:
+    s3c_reply_free(reply);
+    return ok;
+}
+
+bool test_config_api(void)
+{
+    bool ok = true;
+
+    if (!s3c_set_global_config(S3C_CONF_NET_IO_TIMEOUT_SEC, 3)) {
+        log_err("error: failed to set net timeout config\n");
+        ok = false;
+    }
+
+    if (!s3c_set_global_config(S3C_CONF_MAX_REPLY_PREALLOC_SIZE_MB, 4)) {
+        log_err("error: failed to set max reply prealloc config\n");
+        ok = false;
+    }
+
+    if (s3c_set_global_config(S3C_CONF_NET_IO_TIMEOUT_SEC, -1)) {
+        log_err("error: expected negative net timeout config set to fail\n");
+        ok = false;
+    }
+
+    if (s3c_set_global_config(999, 1)) {
+        log_err("error: expected unknown config id set to fail\n");
+        ok = false;
+    }
+
+    // reset to defaults for integration tests
+    s3c_set_global_config(S3C_CONF_NET_IO_TIMEOUT_SEC, 15);
+    s3c_set_global_config(S3C_CONF_MAX_REPLY_PREALLOC_SIZE_MB, 128);
+
+    return ok;
+}
+
+bool test_kvl_helpers(void)
+{
+    bool ok = true;
+    s3cKVL* headers = NULL;
+
+    s3c_kvl_ins(&headers, "z-key", "a");
+    s3c_kvl_ins(&headers, "A-Key", "b");
+    s3c_kvl_ins(&headers, "a-key", "c");
+    s3c_kvl_ins_int(&headers, "x-int", 42);
+
+    if (headers == NULL || strcmp(headers->key, "A-Key") != 0) {
+        log_err("error: kvl insert ordering failed\n");
+        ok = false;
+    }
+
+    s3cKVL* a_key = s3c_kvl_find(headers, "a-key");
+    if (a_key == NULL || strcmp(a_key->value, "b, c") != 0) {
+        log_err("error: kvl duplicate merge failed\n");
+        ok = false;
+    }
+
+    s3cKVL* x_int = s3c_kvl_find(headers, "X-INT");
+    if (x_int == NULL || strcmp(x_int->value, "42") != 0) {
+        log_err("error: kvl integer insert/find failed\n");
+        ok = false;
+    }
+
+    s3c_kvl_remove(&headers, "A-KEY");
+    if (s3c_kvl_find(headers, "a-key") != NULL) {
+        log_err("error: kvl remove failed\n");
+        ok = false;
+    }
+
+    s3c_kvl_free(headers);
+    return ok;
+}
+
+bool test_client_constructor_validation(void)
+{
+    bool ok = true;
+    s3cReply* err = NULL;
+    s3cClient* client = NULL;
+
+    s3cKeys valid_keys = {
+        .access_key_id = "dummy-key-id",
+        .access_key_secret = "dummy-key-secret",
+        .region = "eu-central-1",
+        .endpoint = NULL,
+    };
+
+    client = s3c_client_new(&valid_keys, NULL, &err);
+    if (client == NULL || err != NULL) {
+        log_err("error: expected valid client constructor to succeed\n");
+        ok = false;
+    }
+    s3c_client_free(client);
+    s3c_reply_free(err);
+    client = NULL;
+    err = NULL;
+
+    client = s3c_client_new(NULL, NULL, &err);
+    if (client != NULL || err == NULL || strstr(err->error, "<keys>") == NULL) {
+        log_err("error: expected NULL keys constructor to fail\n");
+        ok = false;
+    }
+    s3c_client_free(client);
+    s3c_reply_free(err);
+    client = NULL;
+    err = NULL;
+
+    s3cKeys no_id = valid_keys;
+    no_id.access_key_id = "";
+
+    client = s3c_client_new(&no_id, NULL, &err);
+    if (client != NULL || err == NULL || strstr(err->error, "access key ID") == NULL) {
+        log_err("error: expected missing access key ID constructor to fail\n");
+        ok = false;
+    }
+    s3c_client_free(client);
+    s3c_reply_free(err);
+    client = NULL;
+    err = NULL;
+
+    s3cKeys no_secret = valid_keys;
+    no_secret.access_key_secret = "";
+
+    client = s3c_client_new(&no_secret, NULL, &err);
+    if (client != NULL || err == NULL || strstr(err->error, "access key secret") == NULL) {
+        log_err("error: expected missing access key secret constructor to fail\n");
+        ok = false;
+    }
+    s3c_client_free(client);
+    s3c_reply_free(err);
+    client = NULL;
+    err = NULL;
+
+    s3cKeys no_region = valid_keys;
+    no_region.region = "";
+
+    client = s3c_client_new(&no_region, NULL, &err);
+    if (client != NULL || err == NULL || strstr(err->error, "no region") == NULL) {
+        log_err("error: expected missing region constructor to fail\n");
+        ok = false;
+    }
+    s3c_client_free(client);
+    s3c_reply_free(err);
+    client = NULL;
+    err = NULL;
+
+    s3cKeys bad_endpoint = valid_keys;
+    bad_endpoint.endpoint = "https://";
+
+    client = s3c_client_new(&bad_endpoint, NULL, &err);
+    if (client != NULL || err == NULL || strstr(err->error, "endpoint") == NULL) {
+        log_err("error: expected invalid endpoint constructor to fail\n");
+        ok = false;
+    }
+    s3c_client_free(client);
+    s3c_reply_free(err);
+    client = NULL;
+    err = NULL;
+
+    if (s3c_client_new(NULL, NULL, NULL) != NULL) {
+        log_err("error: expected constructor NULL keys to fail when out_err is NULL\n");
+        ok = false;
+    }
+
+    return ok;
+}
+
+bool test_api_argument_validation(void)
+{
+    bool ok = true;
+    s3cReply* err = NULL;
+    s3cClient* client = NULL;
+
+    s3cKeys keys = {
+        .access_key_id = "dummy-key-id",
+        .access_key_secret = "dummy-key-secret",
+        .region = "eu-central-1",
+        .endpoint = NULL,
+    };
+
+    client = s3c_client_new(&keys, NULL, &err);
+    if (client == NULL || err != NULL) {
+        log_err("error: failed to initialize client for argument validation tests\n");
+        s3c_client_free(client);
+        s3c_reply_free(err);
+        return false;
+    }
+
+    uint8_t payload = 1;
+
+    ok = expect_error_reply("get_object null client",
+            s3c_get_object(NULL, "b", "k"), "<client>") && ok;
+    ok = expect_error_reply("get_object null bucket",
+            s3c_get_object(client, NULL, "k"), "<bucket>") && ok;
+    ok = expect_error_reply("get_object null object_key",
+            s3c_get_object(client, "b", NULL), "<object_key>") && ok;
+
+    ok = expect_error_reply("get_object_to_file null file",
+            s3c_get_object_to_file(client, "b", "k", NULL), "<file>") && ok;
+    ok = expect_error_reply("put_object null data",
+            s3c_put_object(client, "b", "k", NULL, 1, NULL), "<data>") && ok;
+    ok = expect_error_reply("put_object zero size",
+            s3c_put_object(client, "b", "k", &payload, 0, NULL), "<data_size>") && ok;
+
+    ok = expect_error_reply("put_object_from_file null file",
+            s3c_put_object_from_file(client, "b", "k", NULL, NULL), "<file>") && ok;
+    ok = expect_error_reply("put_object_from_file_multipart null file",
+            s3c_put_object_from_file_multipart(client, "b", "k", NULL, NULL, NULL), "<file>") && ok;
+
+    ok = expect_error_reply("delete_object null bucket",
+            s3c_delete_object(client, NULL, "k"), "<bucket>") && ok;
+    ok = expect_error_reply("create_bucket null bucket",
+            s3c_create_bucket(client, NULL, NULL), "<bucket>") && ok;
+    ok = expect_error_reply("delete_bucket null bucket",
+            s3c_delete_bucket(client, NULL), "<bucket>") && ok;
+
+    s3c_client_free(client);
+    return ok;
+}
+
+bool run_local_tests(void)
+{
+    bool ok = true;
+
+    log_info("running local validation tests...\n");
+
+    ok = test_config_api() && ok;
+    ok = test_kvl_helpers() && ok;
+    ok = test_client_constructor_validation() && ok;
+    ok = test_api_argument_validation() && ok;
+
+    if (ok) {
+        log_info("local validation tests passed\n");
+    } else {
+        log_err("local validation tests failed\n");
+    }
+
+    return ok;
+}
+
+bool create_test_bucket(s3cClient* client)
+{
+    bool ok = true;
+
+    s3cReply* reply = s3c_create_bucket(client, TEST_BUCKET, NULL);
 
     if (reply->error != NULL && reply->http_resp_code != 409) {
         ok = false;
@@ -149,9 +409,9 @@ bool create_test_bucket(const s3cKeys* keys)
     return ok;
 }
 
-bool delete_test_bucket(const s3cKeys* keys)
+bool delete_test_bucket(s3cClient* client)
 {
-    s3cReply* reply = s3c_delete_bucket(keys, TEST_BUCKET);
+    s3cReply* reply = s3c_delete_bucket(client, TEST_BUCKET);
 
     bool ok = reply->error == NULL;
     s3c_reply_free(reply);
@@ -159,7 +419,7 @@ bool delete_test_bucket(const s3cKeys* keys)
     return ok;
 }
 
-bool fetch_and_compare_file(const s3cKeys* keys,
+bool fetch_and_compare_file(s3cClient* client,
                             const char* obj_key,
                             const char* source, size_t source_sz,
                             const char* source_ct)
@@ -170,7 +430,7 @@ bool fetch_and_compare_file(const s3cKeys* keys,
     remove(LOCAL_OBJ_FILE);
 
     s3cReply* reply = s3c_get_object_to_file(
-        keys, TEST_BUCKET, obj_key, LOCAL_OBJ_FILE
+        client, TEST_BUCKET, obj_key, LOCAL_OBJ_FILE
     );
 
     if (reply->error != NULL) {
@@ -223,7 +483,7 @@ cleanup_and_ret:
     return ok;
 }
 
-bool test_big_object(const s3cKeys* keys)
+bool test_big_object(s3cClient* client)
 {
     size_t rt_data_size = 1024 * 1024 * 15;
     const char* object_key = "big-file";
@@ -236,7 +496,7 @@ bool test_big_object(const s3cKeys* keys)
         .next = NULL
     };
 
-    create_test_bucket(keys);
+    create_test_bucket(client);
 
     bool all_good = false;
     char* rt_data = calloc(rt_data_size, 1);
@@ -248,7 +508,7 @@ bool test_big_object(const s3cKeys* keys)
     log_info("put big object...");
 
     s3cReply* reply = s3c_put_object(
-        keys, TEST_BUCKET, object_key,
+        client, TEST_BUCKET, object_key,
         (const uint8_t*)rt_data, rt_data_size, &ct_header
     );
 
@@ -262,7 +522,7 @@ bool test_big_object(const s3cKeys* keys)
     s3c_reply_free(reply);
     log_info("get big object...");
 
-    reply = s3c_get_object(keys, TEST_BUCKET, object_key);
+    reply = s3c_get_object(client, TEST_BUCKET, object_key);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -283,7 +543,7 @@ bool test_big_object(const s3cKeys* keys)
     log_info("get big object to file...");
 
     bool fetch_cmp_ok = fetch_and_compare_file(
-        keys, object_key,
+        client, object_key,
         rt_data, rt_data_size,
         rt_content_type
     );
@@ -299,7 +559,7 @@ bool test_big_object(const s3cKeys* keys)
     s3c_reply_free(reply);
 
     reply = s3c_put_object_from_file(
-        keys, TEST_BUCKET, object_key, LOCAL_OBJ_FILE, &ct_header
+        client, TEST_BUCKET, object_key, LOCAL_OBJ_FILE, &ct_header
     );
 
     if (reply->error != NULL) {
@@ -311,7 +571,7 @@ bool test_big_object(const s3cKeys* keys)
 
     log_info("fetch and compare big object...");
     fetch_cmp_ok = fetch_and_compare_file(
-        keys, object_key,
+        client, object_key,
         rt_data, rt_data_size,
         rt_content_type
     );
@@ -327,7 +587,7 @@ bool test_big_object(const s3cKeys* keys)
     s3c_reply_free(reply);
 
     reply = s3c_put_object_from_file_multipart(
-        keys, TEST_BUCKET, object_key, LOCAL_OBJ_FILE,
+        client, TEST_BUCKET, object_key, LOCAL_OBJ_FILE,
         &ct_header, NULL
     );
 
@@ -341,7 +601,7 @@ bool test_big_object(const s3cKeys* keys)
     log_info("fetch and compare big object after multipart...");
 
     fetch_cmp_ok = fetch_and_compare_file(
-        keys, object_key,
+        client, object_key,
         rt_data, rt_data_size,
         rt_content_type
     );
@@ -356,19 +616,19 @@ bool test_big_object(const s3cKeys* keys)
 
 cleanup_and_ret:
     s3c_reply_free(reply);
-    reply = s3c_delete_object(keys, TEST_BUCKET, object_key);
+    reply = s3c_delete_object(client, TEST_BUCKET, object_key);
     s3c_reply_free(reply);
 
     free(rt_data);
     free(filebuf);
 
     remove(LOCAL_OBJ_FILE);
-    delete_test_bucket(keys);
+    delete_test_bucket(client);
 
     return all_good;
 }
 
-bool run_basic_tests(const s3cKeys* keys)
+bool run_basic_tests(s3cClient* client)
 {
     s3cReply* reply = NULL;
     s3cKVL* headers = NULL;
@@ -377,7 +637,7 @@ bool run_basic_tests(const s3cKeys* keys)
 
     log_info("create bucket...");
 
-    reply = s3c_create_bucket(keys, TEST_BUCKET, NULL);
+    reply = s3c_create_bucket(client, TEST_BUCKET, NULL);
 
     if (reply->error != NULL && reply->http_resp_code != 409) {
         log_err("error: %s\n", reply->error);
@@ -396,7 +656,7 @@ bool run_basic_tests(const s3cKeys* keys)
     s3c_reply_free(reply);
 
     reply = s3c_put_object(
-        keys, TEST_BUCKET, object_key,
+        client, TEST_BUCKET, object_key,
         (const uint8_t*)rt_data, rt_data_size,
         headers
     );
@@ -411,7 +671,7 @@ bool run_basic_tests(const s3cKeys* keys)
 
     log_info("fetching object...");
     s3c_reply_free(reply);
-    reply = s3c_get_object(keys, TEST_BUCKET, object_key);
+    reply = s3c_get_object(client, TEST_BUCKET, object_key);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -445,7 +705,7 @@ bool run_basic_tests(const s3cKeys* keys)
     log_info("fetching object to file...");
 
     bool fetch_cmp_ok = fetch_and_compare_file(
-        keys, object_key,
+        client, object_key,
         rt_data, rt_data_size,
         rt_content_type
     );
@@ -461,7 +721,7 @@ bool run_basic_tests(const s3cKeys* keys)
     s3c_reply_free(reply);
 
     reply = s3c_put_object_from_file(
-       keys, TEST_BUCKET, object_key, LOCAL_OBJ_FILE,
+       client, TEST_BUCKET, object_key, LOCAL_OBJ_FILE,
        headers
     );
 
@@ -475,7 +735,7 @@ bool run_basic_tests(const s3cKeys* keys)
     log_info("delete object...");
     s3c_reply_free(reply);
 
-    reply = s3c_delete_object(keys, TEST_BUCKET, object_key);
+    reply = s3c_delete_object(client, TEST_BUCKET, object_key);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -487,7 +747,7 @@ bool run_basic_tests(const s3cKeys* keys)
     log_info("confirm object was deleted...");
 
     s3c_reply_free(reply);
-    reply = s3c_get_object(keys, TEST_BUCKET, object_key);
+    reply = s3c_get_object(client, TEST_BUCKET, object_key);
 
     if (reply->error == NULL) {
         log_err("error: expected error in reply but no error is set\n");
@@ -497,7 +757,7 @@ bool run_basic_tests(const s3cKeys* keys)
 
     log_info("delete bucket...");
     s3c_reply_free(reply);
-    reply = s3c_delete_bucket(keys, TEST_BUCKET);
+    reply = s3c_delete_bucket(client, TEST_BUCKET);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -524,10 +784,17 @@ int main(int argc, const char** argv)
     int ret_code = 0;
 
     s3cKeys keys = {0};
+    s3cClient* client = NULL;
+    s3cReply* client_err = NULL;
 
     if (argc > 1) {
         keys_file = argv[1];
         log_info("using arg supplied keys file '%s'\n", keys_file);
+    }
+
+    bool ok = run_local_tests();
+    if (!ok) {
+        ret_code = 1;
     }
 
     const char* err = read_s3c_keys_file(keys_file, &keys);
@@ -538,12 +805,20 @@ int main(int argc, const char** argv)
         goto cleanup_and_ret;
     }
 
-    bool ok = run_basic_tests(&keys);
+    client = s3c_client_new(&keys, NULL, &client_err);
+    if (client == NULL) {
+        log_info("failed to run tests: %s\n",
+                 client_err != NULL ? client_err->error : "failed to initialize s3 client");
+        ret_code = 1;
+        goto cleanup_and_ret;
+    }
+
+    ok = run_basic_tests(client);
     if (!ok) {
         ret_code = 1;
     }
 
-    ok = test_big_object(&keys);
+    ok = test_big_object(client);
     if (!ok) {
         ret_code = 1;
     }
@@ -559,6 +834,8 @@ cleanup_and_ret:
     free(keys.access_key_secret);
     free(keys.region);
     free(keys.endpoint);
+    s3c_client_free(client);
+    s3c_reply_free(client_err);
 
     return ret_code;
 }

@@ -37,31 +37,43 @@ static const char* S3_HTTP_VERSION      = "HTTP/1.1";
 #define S3C_DATE_TIME_STAMP_SIZE sizeof("yyyymmddThhmmssZ")
 #define S3C_DATE_STAMP_SIZE      sizeof("yyyymmdd")
 
-static struct {
+#define S3C_DEF_NET_IO_TIMEOUT_SEC          15U
+#define S3C_DEF_MAX_REPLY_PREALLOC_SIZE_MB 128U
+#define S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB  10U
+
+typedef struct {
     uint32_t net_io_timeout_sec;
     uint32_t max_reply_prealloc_size_mb;
     uint32_t str_buf_max_cap_reserve_mb;
+} RuntimeConfs;
 
-} S3C_GLOBAL_CONFS = {
-    .net_io_timeout_sec           = 15,
-    .max_reply_prealloc_size_mb   = 128,
-    .str_buf_max_cap_reserve_mb   = 10,
+static RuntimeConfs S3C_DEFAULT_CONFS = {
+    .net_io_timeout_sec = S3C_DEF_NET_IO_TIMEOUT_SEC,
+    .max_reply_prealloc_size_mb = S3C_DEF_MAX_REPLY_PREALLOC_SIZE_MB,
+    .str_buf_max_cap_reserve_mb = S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB,
 };
 
 typedef struct {
-    SSL*     ssl;
-    SSL_CTX* ssl_ctx;
+    SSL* ssl;
 } OsslContext;
 
-static const char* ossl_init(OsslContext*);
+struct s3cClient {
+    s3cKeys keys;
+    RuntimeConfs confs;
+    SSL_CTX* ssl_ctx;
+};
+
+static const char* ossl_ctx_init(SSL_CTX** out_ctx);
+static const char* ossl_init(OsslContext*, SSL_CTX* ssl_ctx);
 static void        ossl_free(OsslContext*);
-static const char* ossl_connect(OsslContext*, const char* host);
+static const char* ossl_connect(OsslContext*, const char* host, uint32_t net_timeout_sec);
 
 
 typedef struct {
     size_t total_size;
     size_t cursor;
     void* opaque;
+    const RuntimeConfs* confs;
 } StreamContext;
 
 typedef struct {
@@ -86,7 +98,7 @@ typedef struct {
 
 typedef struct {
     bool           ok;
-    const s3cKeys* keys;
+    const s3cClient* client;
     s3cReply*      reply;
     OsslContext*   ossl_ctx;
     OpArgs         args;
@@ -96,6 +108,7 @@ typedef struct {
     char*  ptr;
     size_t len;
     size_t cap;
+    uint32_t max_cap_reserve_mb;
 } StrBuf;
 
 typedef struct {
@@ -108,7 +121,7 @@ typedef struct {
     char date      [S3C_DATE_STAMP_SIZE];
 } DateStamps;
 
-static void op_context_init(OpContext*, OpArgs args, const s3cKeys*,  s3cReply*);
+static void op_context_init(OpContext*, OpArgs args, const s3cClient*,  s3cReply*);
 static void op_context_free(OpContext*);
 static void op_run_request(OpContext* op, const char* html_verb);
 static void op_send_request(OpContext*, StrBuf* http_request);
@@ -118,6 +131,7 @@ static void op_set_error(OpContext* op, const char* error);
 static void op_set_error_fmt(OpContext* op, const char* fmt, ...);
 
 static StrBuf str_init(size_t cap);
+static StrBuf str_init_conf(size_t cap, uint32_t max_cap_reserve_mb);
 static size_t str_set_cap(StrBuf*, size_t cap);
 static void   str_destroy(StrBuf*);
 static size_t str_push(StrBuf*, const char* a, size_t a_len);
@@ -130,16 +144,22 @@ static size_t str_set(StrBuf*, const char*);
 static char*  str_extract(StrBuf*);
 
 static void s3c_kvl_upsert(s3cKVL** head, const char* name, const char* value);
+static void set_runtime_confs(RuntimeConfs* out, const s3cClientOpts* opts);
+static char* normalize_endpoint_host(const char* endpoint);
 
 uint64_t s3c_set_global_config(uint64_t opt, int64_t value)
 {
+    if (value < 0) {
+        return 0;
+    }
+
     switch (opt) {
         case S3C_CONF_NET_IO_TIMEOUT_SEC:
-            S3C_GLOBAL_CONFS.net_io_timeout_sec = value;
+            S3C_DEFAULT_CONFS.net_io_timeout_sec = value;
             return 1;
 
         case S3C_CONF_MAX_REPLY_PREALLOC_SIZE_MB:
-            S3C_GLOBAL_CONFS.max_reply_prealloc_size_mb = value;
+            S3C_DEFAULT_CONFS.max_reply_prealloc_size_mb = value;
             return 1;
     }
 
@@ -182,6 +202,163 @@ void s3c_reply_free(s3cReply* reply)
     free(reply->data);
 
     free(reply);
+}
+
+static void set_runtime_confs(RuntimeConfs* out, const s3cClientOpts* opts)
+{
+    *out = S3C_DEFAULT_CONFS;
+
+    if (opts == NULL) {
+        return;
+    }
+
+    if (opts->net_io_timeout_sec > 0) {
+        out->net_io_timeout_sec = opts->net_io_timeout_sec;
+    }
+    if (opts->max_reply_prealloc_size_mb > 0) {
+        out->max_reply_prealloc_size_mb = opts->max_reply_prealloc_size_mb;
+    }
+    if (opts->str_buf_max_cap_reserve_mb > 0) {
+        out->str_buf_max_cap_reserve_mb = opts->str_buf_max_cap_reserve_mb;
+    }
+}
+
+static char* normalize_endpoint_host(const char* endpoint)
+{
+    if (endpoint == NULL || *endpoint == '\0') {
+        return NULL;
+    }
+
+    const char* host = endpoint;
+    const char* https_prefix = "https://";
+    size_t pref_len = strlen(https_prefix);
+
+    if (strncmp(host, https_prefix, pref_len) == 0) {
+        host += pref_len;
+    }
+
+    while (*host == '/') {
+        host += 1;
+    }
+
+    if (*host == '\0') {
+        return NULL;
+    }
+
+    const char* end = host + strlen(host);
+    while (end > host && end[-1] == '/') {
+        end -= 1;
+    }
+
+    ptrdiff_t host_len = end - host;
+    if (host_len < 1) {
+        return NULL;
+    }
+
+    char* out = calloc(host_len + 1, 1);
+    memcpy(out, host, host_len);
+    out[host_len] = '\0';
+
+    return out;
+}
+
+s3cClient* s3c_client_new(const s3cKeys* keys,
+                          const s3cClientOpts* opts,
+                          s3cReply** out_err)
+{
+    if (out_err != NULL) {
+        *out_err = NULL;
+    }
+
+    if (keys == NULL) {
+        if (out_err != NULL) {
+            *out_err = s3c_reply_alloc("provided arguments missing value for <keys>");
+        }
+        return NULL;
+    }
+
+    if (keys->access_key_id == NULL || *keys->access_key_id == '\0') {
+        if (out_err != NULL) {
+            *out_err = s3c_reply_alloc("provided keys no access key ID set");
+        }
+        return NULL;
+    }
+
+    if (keys->access_key_secret == NULL || *keys->access_key_secret == '\0') {
+        if (out_err != NULL) {
+            *out_err = s3c_reply_alloc("provided keys no access key secret set");
+        }
+        return NULL;
+    }
+
+    if (keys->region == NULL || *keys->region == '\0') {
+        if (out_err != NULL) {
+            *out_err = s3c_reply_alloc("provided keys no region set");
+        }
+        return NULL;
+    }
+
+    s3cClient* client = calloc(1, sizeof(s3cClient));
+    if (client == NULL) {
+        if (out_err != NULL) {
+            *out_err = s3c_reply_alloc("failed to allocate s3 client");
+        }
+        return NULL;
+    }
+
+    set_runtime_confs(&client->confs, opts);
+
+    client->keys.access_key_id = str_dup(keys->access_key_id);
+    client->keys.access_key_secret = str_dup(keys->access_key_secret);
+    client->keys.region = str_dup(keys->region);
+
+    if (keys->endpoint != NULL && *keys->endpoint != '\0') {
+        client->keys.endpoint = normalize_endpoint_host(keys->endpoint);
+        if (client->keys.endpoint == NULL) {
+            if (out_err != NULL) {
+                *out_err = s3c_reply_alloc("provided endpoint is invalid");
+            }
+            s3c_client_free(client);
+            return NULL;
+        }
+    }
+
+    if (client->keys.access_key_id == NULL ||
+        client->keys.access_key_secret == NULL ||
+        client->keys.region == NULL) {
+
+        if (out_err != NULL) {
+            *out_err = s3c_reply_alloc("failed to allocate s3 client");
+        }
+        s3c_client_free(client);
+        return NULL;
+    }
+
+    const char* err = ossl_ctx_init(&client->ssl_ctx);
+    if (err != NULL) {
+        if (out_err != NULL) {
+            *out_err = s3c_reply_alloc(err);
+        }
+        s3c_client_free(client);
+        return NULL;
+    }
+
+    return client;
+}
+
+void s3c_client_free(s3cClient* client)
+{
+    if (client == NULL) {
+        return;
+    }
+
+    free(client->keys.access_key_id);
+    free(client->keys.access_key_secret);
+    free(client->keys.region);
+    free(client->keys.endpoint);
+
+    SSL_CTX_free(client->ssl_ctx);
+    free(client);
 }
 
 static s3cReply* check_arg_str(const char* arg, const char* arg_name)
@@ -228,12 +405,12 @@ static s3cReply* check_arg_bucket_key(const char* bucket, const char* object_key
     return NULL;
 }
 
-static s3cReply* run_s3_op(const s3cKeys* keys, const char* html_verb, OpArgs args)
+static s3cReply* run_s3_op(const s3cClient* client, const char* html_verb, OpArgs args)
 {
     OpContext* op = calloc(1, sizeof(OpContext));
     s3cReply* reply = s3c_reply_alloc(NULL);
 
-    op_context_init(op, args, keys, reply);
+    op_context_init(op, args, client, reply);
 
     if (!op->ok) {
         goto cleanup_and_ret;
@@ -251,11 +428,14 @@ static const char* fn_stream_write_str_buf(const char* bytes, size_t num_bytes,
                                            StreamContext* c)
 {
     StrBuf* str_buf = c->opaque;
+    const RuntimeConfs* confs = c->confs != NULL
+        ? c->confs
+        : &S3C_DEFAULT_CONFS;
 
     if (str_buf->cap < 1 && c->total_size > 0) {
 
         size_t max_mem_prealloc_size =
-            S3C_GLOBAL_CONFS.max_reply_prealloc_size_mb * 1024 * 1024;
+            confs->max_reply_prealloc_size_mb * 1024 * 1024;
 
         if (c->total_size < max_mem_prealloc_size) {
             str_set_cap(str_buf, c->total_size);
@@ -356,21 +536,26 @@ StreamRead make_stream_rd_from_str_buf(StrBuf* buf)
     return stream;
 }
 
-s3cReply* s3c_get_object(const s3cKeys* keys,
-                         const char* bucket, const char* object_key)
+s3cReply* s3c_get_object(s3cClient* client,
+                            const char* bucket, const char* object_key)
 {
     s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
         return err;
     }
 
-    StrBuf res_buf = {0};
+    StrBuf res_buf = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
 
     StreamWrite stream_wr = {
         .fn_write = &fn_stream_write_str_buf,
         .ctx = {
             .opaque = &res_buf,
+            .confs = &client->confs,
         }
     };
 
@@ -380,7 +565,7 @@ s3cReply* s3c_get_object(const s3cKeys* keys,
         .stream_wr = &stream_wr,
     };
 
-    s3cReply* reply = run_s3_op(keys, "GET", args);
+    s3cReply* reply = run_s3_op(client, "GET", args);
 
     if (reply->error == NULL) {
         reply->data = (uint8_t*)res_buf.ptr;
@@ -392,11 +577,15 @@ s3cReply* s3c_get_object(const s3cKeys* keys,
     return reply;
 }
 
-s3cReply* s3c_get_object_to_file(const s3cKeys* keys,
-                                 const char* bucket, const char* object_key,
-                                 const char* file)
+s3cReply* s3c_get_object_to_file(s3cClient* client,
+                                    const char* bucket, const char* object_key,
+                                    const char* file)
 {
     s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
         return err;
@@ -425,6 +614,7 @@ s3cReply* s3c_get_object_to_file(const s3cKeys* keys,
         .fn_write = &fn_stream_write_file,
         .ctx = {
             .opaque = fp,
+            .confs = &client->confs,
         }
     };
 
@@ -434,7 +624,7 @@ s3cReply* s3c_get_object_to_file(const s3cKeys* keys,
         .stream_wr = &stream_wr
     };
 
-    s3cReply* res = run_s3_op(keys, "GET", args);
+    s3cReply* res = run_s3_op(client, "GET", args);
 
     if (res->error != NULL && file_is_new) {
         remove(file);
@@ -445,12 +635,16 @@ s3cReply* s3c_get_object_to_file(const s3cKeys* keys,
     return res;
 }
 
-s3cReply* s3c_put_object(const s3cKeys* keys,
-                         const char* bucket, const char* object_key,
-                         const uint8_t* data, uint64_t data_size,
-                         const s3cKVL* headers)
+s3cReply* s3c_put_object(s3cClient* client,
+                            const char* bucket, const char* object_key,
+                            const uint8_t* data, uint64_t data_size,
+                            const s3cKVL* headers)
 {
     s3cReply* err = check_arg_bucket_key(bucket, object_key);
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
 
     if (err != NULL) {
         return err;
@@ -470,6 +664,7 @@ s3cReply* s3c_put_object(const s3cKeys* keys,
             .total_size = data_size,
             .cursor = 0,
             .opaque = (void*)data,
+            .confs = &client->confs,
         }
     };
 
@@ -480,7 +675,7 @@ s3cReply* s3c_put_object(const s3cKeys* keys,
         .stream_rd = &stream_rd,
     };
 
-    s3cReply* reply = run_s3_op(keys, "PUT", args);
+    s3cReply* reply = run_s3_op(client, "PUT", args);
 
     return reply;
 }
@@ -516,7 +711,7 @@ cleanup_and_ret:
     str_destroy(&tag_str);
 }
 
-static s3cReply* s3c_multipart_upload_abort(const s3cKeys* keys,
+static s3cReply* s3c_multipart_upload_abort(const s3cClient* client,
                                             const char* bucket, const char* obj_key,
                                             const char* upload_id)
 {
@@ -531,10 +726,10 @@ static s3cReply* s3c_multipart_upload_abort(const s3cKeys* keys,
         .query_args = &query_args,
     };
 
-    return run_s3_op(keys, "DELETE", args);
+    return run_s3_op(client, "DELETE", args);
 }
 
-static s3cReply* s3c_multipart_upload_init(const s3cKeys* keys,
+static s3cReply* s3c_multipart_upload_init(const s3cClient* client,
                                            const char* bucket, const char* object_key,
                                            const s3cKVL* headers,
                                            StrBuf* out_upload_id)
@@ -551,7 +746,7 @@ static s3cReply* s3c_multipart_upload_init(const s3cKeys* keys,
         .query_args = &query_args,
     };
 
-    s3cReply* reply = run_s3_op(keys, "POST", args);
+    s3cReply* reply = run_s3_op(client, "POST", args);
 
     if (reply->error) {
         return reply;
@@ -575,12 +770,12 @@ static s3cReply* s3c_multipart_upload_init(const s3cKeys* keys,
     return reply;
 }
 
-static s3cReply* s3c_multipart_upload_finish(const s3cKeys* keys,
+static s3cReply* s3c_multipart_upload_finish(const s3cClient* client,
                                              const char* bucket, const char* object_key,
                                              const char* upload_id, s3cKVL* etags)
 {
-    StrBuf body = str_init(512);
-    StrBuf error_tag = {0};
+    StrBuf body = str_init_conf(512, client->confs.str_buf_max_cap_reserve_mb);
+    StrBuf error_tag = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
 
     str_push_cstr(&body, "<CompleteMultipartUpload "
                          "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">");
@@ -616,7 +811,7 @@ static s3cReply* s3c_multipart_upload_finish(const s3cKeys* keys,
         .stream_rd = &stream_rd,
     };
 
-    s3cReply* reply = run_s3_op(keys, "POST", args);
+    s3cReply* reply = run_s3_op(client, "POST", args);
 
     if (reply->error) {
         goto cleanup_and_ret;
@@ -640,7 +835,7 @@ cleanup_and_ret:
     return reply;
 }
 
-static s3cReply* s3c_multipart_upload_run(const s3cKeys* keys,
+static s3cReply* s3c_multipart_upload_run(const s3cClient* client,
                                           const char* bucket, const char* obj_key,
                                           FILE* fp, const char* upload_id,
                                           const s3cMultipartOpts* opts)
@@ -649,7 +844,7 @@ static s3cReply* s3c_multipart_upload_run(const s3cKeys* keys,
     s3cReply* reply = NULL;
     s3cKVL* etags_head = NULL;
     s3cKVL* etags_tail = NULL;
-    StrBuf iota_buf = {0};
+    StrBuf iota_buf = str_init(0);
 
     fseek(fp, 0, SEEK_END);
     size_t file_size = ftell(fp);
@@ -672,6 +867,7 @@ static s3cReply* s3c_multipart_upload_run(const s3cKeys* keys,
         .fn_read = &fn_stream_read_mem,
         .ctx = {
             .opaque = chunk_buf,
+            .confs = &client->confs,
         }
     };
 
@@ -705,7 +901,7 @@ static s3cReply* s3c_multipart_upload_run(const s3cKeys* keys,
         unsigned num_retries = 0;
 
         while (1) {
-            reply = run_s3_op(keys, "PUT", op_args);
+            reply = run_s3_op(client, "PUT", op_args);
 
             if (reply->error == NULL) {
                 break;
@@ -751,7 +947,7 @@ static s3cReply* s3c_multipart_upload_run(const s3cKeys* keys,
     }
 
     reply = s3c_multipart_upload_finish(
-        keys, bucket, obj_key, upload_id, etags_head
+        client, bucket, obj_key, upload_id, etags_head
     );
 
 cleanup_and_ret:
@@ -762,11 +958,17 @@ cleanup_and_ret:
     return reply;
 }
 
-s3cReply* s3c_put_object_from_file(const s3cKeys* keys,
-                                   const char* bucket, const char* object_key,
-                                   const char* file, const s3cKVL* headers)
+s3cReply* s3c_put_object_from_file(s3cClient* client,
+                                      const char* bucket, const char* object_key,
+                                      const char* file, const s3cKVL* headers)
 {
-    s3cReply* err = check_arg_bucket_key(bucket, object_key);
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    err = check_arg_bucket_key(bucket, object_key);
 
     if (err != NULL) {
         return err;
@@ -777,7 +979,7 @@ s3cReply* s3c_put_object_from_file(const s3cKeys* keys,
     }
 
     s3cReply* reply = NULL;
-    StrBuf read_buf = {0};
+    StrBuf read_buf = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
 
     FILE* fp = fopen(file, "r");
 
@@ -801,6 +1003,7 @@ s3cReply* s3c_put_object_from_file(const s3cKeys* keys,
             .total_size = file_size,
             .cursor = 0,
             .opaque = &bf,
+            .confs = &client->confs,
         }
     };
 
@@ -811,7 +1014,7 @@ s3cReply* s3c_put_object_from_file(const s3cKeys* keys,
         .stream_rd = &stream_rd,
     };
 
-    reply = run_s3_op(keys, "PUT", args);
+    reply = run_s3_op(client, "PUT", args);
     goto cleanup_and_ret;
 
 cleanup_and_ret:
@@ -824,11 +1027,11 @@ cleanup_and_ret:
     return reply;
 }
 
-s3cReply* s3c_put_object_from_file_multipart(const s3cKeys* keys,
-                                             const char* bucket, const char* object_key,
-                                             const char* file,
-                                             const s3cKVL* headers,
-                                             const s3cMultipartOpts* opts)
+s3cReply* s3c_put_object_from_file_multipart(s3cClient* client,
+                                                const char* bucket, const char* object_key,
+                                                const char* file,
+                                                const s3cKVL* headers,
+                                                const s3cMultipartOpts* opts)
 {
     s3cMultipartOpts default_opts = {
         .part_size = 6 * 1024 * 1024,
@@ -839,7 +1042,13 @@ s3cReply* s3c_put_object_from_file_multipart(const s3cKeys* keys,
         opts = &default_opts;
     }
 
-    s3cReply* err = check_arg_bucket_key(bucket, object_key);
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    err = check_arg_bucket_key(bucket, object_key);
 
     if (err != NULL) {
         return err;
@@ -850,7 +1059,7 @@ s3cReply* s3c_put_object_from_file_multipart(const s3cKeys* keys,
     }
 
     s3cReply* reply = NULL;
-    StrBuf upload_id = {0};
+    StrBuf upload_id = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
 
     FILE* fp = fopen(file, "r");
 
@@ -860,7 +1069,7 @@ s3cReply* s3c_put_object_from_file_multipart(const s3cKeys* keys,
     }
 
     reply = s3c_multipart_upload_init(
-        keys, bucket, object_key, headers,
+        client, bucket, object_key, headers,
         &upload_id
     );
 
@@ -871,12 +1080,12 @@ s3cReply* s3c_put_object_from_file_multipart(const s3cKeys* keys,
     s3c_reply_free(reply);
 
     reply = s3c_multipart_upload_run(
-        keys, bucket, object_key, fp, upload_id.ptr, opts
+        client, bucket, object_key, fp, upload_id.ptr, opts
     );
 
     if (reply->error) {
         s3cReply* rep_abort = s3c_multipart_upload_abort(
-            keys, bucket, object_key, upload_id.ptr
+            client, bucket, object_key, upload_id.ptr
         );
 
         s3c_reply_free(rep_abort);
@@ -893,9 +1102,14 @@ cleanup_and_ret:
     return reply;
 }
 
-s3cReply* s3c_delete_object(const s3cKeys* keys, const char* bucket, const char* object_key)
+s3cReply* s3c_delete_object(s3cClient* client,
+                               const char* bucket, const char* object_key)
 {
     s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
         return err;
@@ -906,26 +1120,32 @@ s3cReply* s3c_delete_object(const s3cKeys* keys, const char* bucket, const char*
         .object_key = object_key,
     };
 
-    return run_s3_op(keys, "DELETE", args);
+    return run_s3_op(client, "DELETE", args);
 }
 
-s3cReply* s3c_create_bucket(const s3cKeys* keys, const char* bucket, const s3cKVL* headers)
+s3cReply* s3c_create_bucket(s3cClient* client,
+                               const char* bucket, const s3cKVL* headers)
 {
     s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
         return err;
     }
 
-    StrBuf req_body = str_init(256);
+    StrBuf req_body = str_init_conf(256, client->confs.str_buf_max_cap_reserve_mb);
     str_push_cstr(&req_body, "<CreateBucketConfiguration "
                              "xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
                              "<LocationConstraint>");
-    str_push_cstr(&req_body, keys->region);
+    str_push_cstr(&req_body, client->keys.region);
     str_push_cstr(&req_body, "</LocationConstraint>"
                              "</CreateBucketConfiguration>");
 
     StreamRead stream_rd = make_stream_rd_from_str_buf(&req_body);
+    stream_rd.ctx.confs = &client->confs;
 
     OpArgs args = {
         .bucket = bucket,
@@ -933,15 +1153,19 @@ s3cReply* s3c_create_bucket(const s3cKeys* keys, const char* bucket, const s3cKV
         .stream_rd = &stream_rd,
     };
 
-    s3cReply* reply = run_s3_op(keys, "PUT", args);
+    s3cReply* reply = run_s3_op(client, "PUT", args);
     str_destroy(&req_body);
 
     return reply;
 }
 
-s3cReply* s3c_delete_bucket(const s3cKeys* keys, const char* bucket)
+s3cReply* s3c_delete_bucket(s3cClient* client, const char* bucket)
 {
     s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
         return err;
@@ -951,7 +1175,7 @@ s3cReply* s3c_delete_bucket(const s3cKeys* keys, const char* bucket)
         .bucket = bucket
     };
 
-    return run_s3_op(keys, "DELETE", args);
+    return run_s3_op(client, "DELETE", args);
 }
 
 static void set_date_stamps(DateStamps* dates)
@@ -970,24 +1194,18 @@ static void set_date_stamps(DateStamps* dates)
     dates->date[S3C_DATE_STAMP_SIZE - 1] = '\0';
 }
 
-static StrBuf get_req_host(const s3cKeys* keys)
+static StrBuf get_req_host(const s3cClient* client)
 {
-    StrBuf endpoint = str_init(128);
+    StrBuf endpoint = str_init_conf(128, client->confs.str_buf_max_cap_reserve_mb);
 
-    const char* conf_endpoint = keys->endpoint;
+    const char* conf_endpoint = client->keys.endpoint;
 
     if (conf_endpoint == NULL || *conf_endpoint == '\0') {
         str_set      (&endpoint, "s3.");
-        str_push_cstr(&endpoint, keys->region);
+        str_push_cstr(&endpoint, client->keys.region);
         str_push_cstr(&endpoint, ".amazonaws.com");
 
         return endpoint;
-    }
-
-    char* proto = strstr(conf_endpoint, "https://");
-
-    if (proto == conf_endpoint) {
-        conf_endpoint += sizeof("https://") - 1;
     }
 
     str_set(&endpoint, conf_endpoint);
@@ -995,28 +1213,33 @@ static StrBuf get_req_host(const s3cKeys* keys)
     return endpoint;
 }
 
-static void op_context_init(OpContext* op, OpArgs args, const s3cKeys* keys, s3cReply* reply)
+static void op_context_init(OpContext* op, OpArgs args, const s3cClient* client, s3cReply* reply)
 {
     op->ok = false;
     op->reply = reply;
-    op->keys = keys;
+    op->client = client;
     op->args = args;
 
-    if (keys->access_key_id == NULL ||
-        strlen(keys->access_key_id) < 1) {
+    if (client == NULL) {
+        op_set_error(op, "provided arguments missing value for <client>");
+        return;
+    }
+
+    if (client->keys.access_key_id == NULL ||
+        strlen(client->keys.access_key_id) < 1) {
 
         op_set_error(op, "provided keys no access key ID set");
         return;
     }
 
-    if (keys->access_key_secret == NULL ||
-        strlen(keys->access_key_secret) < 1) {
+    if (client->keys.access_key_secret == NULL ||
+        strlen(client->keys.access_key_secret) < 1) {
 
         op_set_error(op, "provided keys no access key secret set");
         return;
     }
 
-    if (keys->region == NULL || strlen(keys->region) < 1) {
+    if (client->keys.region == NULL || strlen(client->keys.region) < 1) {
         op_set_error(op, "provided keys no region set");
         return;
     }
@@ -1024,7 +1247,7 @@ static void op_context_init(OpContext* op, OpArgs args, const s3cKeys* keys, s3c
     OsslContext* octx = calloc(1, sizeof(OsslContext));
 
     op->ossl_ctx = octx;
-    const char* err = ossl_init(op->ossl_ctx);
+    const char* err = ossl_init(op->ossl_ctx, client->ssl_ctx);
 
     if (err != NULL) {
         op_set_error(op, err);
@@ -1375,15 +1598,16 @@ cleanup_and_ret:
 
 static void op_run_request(OpContext* op, const char* html_verb)
 {
-    StrBuf request = str_init(128),
-           request_sig = str_init(128),
-           sig_headers = str_init(128),
-           sig_header_names = str_init(128),
-           auth_header = str_init(128),
-           sig_url = str_init(128),
-           req_url = str_init(128),
-           query_str = str_init(128),
-           endpoint = get_req_host(op->keys);
+    uint32_t max_cap_reserve_mb = op->client->confs.str_buf_max_cap_reserve_mb;
+    StrBuf request = str_init_conf(128, max_cap_reserve_mb),
+           request_sig = str_init_conf(128, max_cap_reserve_mb),
+           sig_headers = str_init_conf(128, max_cap_reserve_mb),
+           sig_header_names = str_init_conf(128, max_cap_reserve_mb),
+           auth_header = str_init_conf(128, max_cap_reserve_mb),
+           sig_url = str_init_conf(128, max_cap_reserve_mb),
+           req_url = str_init_conf(128, max_cap_reserve_mb),
+           query_str = str_init_conf(128, max_cap_reserve_mb),
+           endpoint = get_req_host(op->client);
 
     s3cKVL* headers = NULL;
 
@@ -1460,7 +1684,7 @@ static void op_run_request(OpContext* op, const char* html_verb)
 
     // create signature for the authorization header
     bool sig_ok = gen_auth_header(
-        op->keys, &dates,
+        &op->client->keys, &dates,
         &request_sig, &sig_header_names,
         &auth_header
     );
@@ -1507,27 +1731,37 @@ cleanup_and_ret:
     s3c_kvl_free(headers);
 }
 
-static const char* ossl_init(OsslContext* octx)
+static const char* ossl_ctx_init(SSL_CTX** out_ctx)
 {
-    octx->ssl_ctx = SSL_CTX_new(TLS_client_method());
+    *out_ctx = NULL;
 
-    if (octx->ssl_ctx == NULL) {
+    SSL_CTX* ssl_ctx = SSL_CTX_new(TLS_client_method());
+
+    if (ssl_ctx == NULL) {
         return "openssl failed to allocate ssl context";
     }
 
     // Configure CTX before SSL_new: SSL_new copies verify_mode from the CTX
     // at creation time, so these must be set before the SSL object is created.
-    SSL_CTX_set_verify(octx->ssl_ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_verify(ssl_ctx, SSL_VERIFY_PEER, NULL);
 
-    if (!SSL_CTX_set_default_verify_paths(octx->ssl_ctx)) {
+    if (!SSL_CTX_set_default_verify_paths(ssl_ctx)) {
+        SSL_CTX_free(ssl_ctx);
         return "openssl failed to set the default trusted certificate store";
     }
 
-    if (!SSL_CTX_set_min_proto_version(octx->ssl_ctx, TLS1_2_VERSION)) {
+    if (!SSL_CTX_set_min_proto_version(ssl_ctx, TLS1_2_VERSION)) {
+        SSL_CTX_free(ssl_ctx);
         return "openssl failed to set the minimum TLS protocol version";
     }
 
-    octx->ssl = SSL_new(octx->ssl_ctx);
+    *out_ctx = ssl_ctx;
+    return NULL;
+}
+
+static const char* ossl_init(OsslContext* octx, SSL_CTX* ssl_ctx)
+{
+    octx->ssl = SSL_new(ssl_ctx);
 
     if (octx->ssl == NULL) {
         return "openssl failed to allocate ssl object";
@@ -1547,7 +1781,6 @@ static void ossl_free(OsslContext* octx)
     // SSL_free frees the BIO chain; since the BIO was created with BIO_CLOSE
     // the socket fd is closed as part of that — no manual close needed here.
     SSL_free(octx->ssl);
-    SSL_CTX_free(octx->ssl_ctx);
 
     free(octx);
 }
@@ -1576,7 +1809,7 @@ static const char* ossl_proc_io_res(OsslContext* octx, int io_res)
     return  "unknown net error occured";
 }
 
-static BIO* create_socket_bio(const char *host, const char *proto)
+static BIO* create_socket_bio(const char *host, const char *proto, uint32_t net_timeout_sec)
 {
     BIO_ADDRINFO* bio_addr_info;
 
@@ -1594,7 +1827,7 @@ static BIO* create_socket_bio(const char *host, const char *proto)
     const BIO_ADDRINFO *ai = NULL;
 
     struct timeval timeout;
-    timeout.tv_sec = S3C_GLOBAL_CONFS.net_io_timeout_sec;
+    timeout.tv_sec = net_timeout_sec;
     timeout.tv_usec = 0;
 
     for (ai = bio_addr_info; sock == -1 && ai != NULL; ai = BIO_ADDRINFO_next(ai)) {
@@ -1605,7 +1838,7 @@ static BIO* create_socket_bio(const char *host, const char *proto)
             continue;
         }
 
-        if (S3C_GLOBAL_CONFS.net_io_timeout_sec > 0) {
+        if (net_timeout_sec > 0) {
 
             if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
                 setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
@@ -1643,9 +1876,9 @@ static BIO* create_socket_bio(const char *host, const char *proto)
     return bio;
 }
 
-static const char* ossl_connect(OsslContext* octx, const char* host)
+static const char* ossl_connect(OsslContext* octx, const char* host, uint32_t net_timeout_sec)
 {
-    BIO* bio = create_socket_bio(host, "https");
+    BIO* bio = create_socket_bio(host, "https", net_timeout_sec);
 
     if (bio == NULL) {
         return "failed to resolve host";
@@ -1876,7 +2109,7 @@ static int64_t parse_reply_content_length(s3cKVL* rep_headers)
 static void op_read_reply(OpContext* op)
 {
     const size_t RECV_CAP = 1024 * 1024;
-    StrBuf recv_buf = {0};
+    StrBuf recv_buf = str_init_conf(0, op->client->confs.str_buf_max_cap_reserve_mb);
 
     bool headers_parsed = false;
     unsigned http_resp_code = 0;
@@ -1978,9 +2211,13 @@ cleanup_and_ret:
 
 static void op_send_request(OpContext* op, StrBuf* rq_head)
 {
-    StrBuf endpoint = get_req_host(op->keys);
+    StrBuf endpoint = get_req_host(op->client);
 
-    const char* conn_err = ossl_connect(op->ossl_ctx, endpoint.ptr);
+    const char* conn_err = ossl_connect(
+        op->ossl_ctx,
+        endpoint.ptr,
+        op->client->confs.net_io_timeout_sec
+    );
 
     if (conn_err) {
         op_set_error(op, conn_err);
@@ -2227,12 +2464,18 @@ void s3c_kvl_free(s3cKVL* head)
 
 static StrBuf str_init(size_t cap)
 {
+    return str_init_conf(cap, S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB);
+}
+
+static StrBuf str_init_conf(size_t cap, uint32_t max_cap_reserve_mb)
+{
     char* ptr = cap > 0 ? calloc(1, cap + 1) : NULL;
 
     StrBuf res = {
         .ptr = ptr,
         .len = 0,
-        .cap = cap
+        .cap = cap,
+        .max_cap_reserve_mb = max_cap_reserve_mb,
     };
 
     return res;
@@ -2241,13 +2484,13 @@ static StrBuf str_init(size_t cap)
 static void str_destroy(StrBuf* s)
 {
     free(s->ptr);
-    *s = str_init(0);
+    *s = str_init_conf(0, s->max_cap_reserve_mb);
 }
 
 static char* str_extract(StrBuf* s)
 {
     char* ret = s->ptr;
-    *s = str_init(0);
+    *s = str_init_conf(0, s->max_cap_reserve_mb);
 
     return ret;
 }
@@ -2284,8 +2527,11 @@ static size_t str_push(StrBuf* s, const char* a, size_t a_len)
             s->cap = 64;
         }
 
-        size_t max_reserve_size =
-            S3C_GLOBAL_CONFS.str_buf_max_cap_reserve_mb * 1024 * 1024;
+        uint32_t max_cap_reserve_mb = s->max_cap_reserve_mb > 0
+            ? s->max_cap_reserve_mb
+            : S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB;
+
+        size_t max_reserve_size = max_cap_reserve_mb * 1024 * 1024;
 
         size_t cap_growth = s->cap / 2 < max_reserve_size
             ? s->cap / 2
@@ -2359,10 +2605,3 @@ static size_t str_push_int(StrBuf* s, int64_t i)
 
     return str_push(s, buf, len);
 }
-
-
-
-
-
-
-
