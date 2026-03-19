@@ -656,6 +656,55 @@ s3cReply* s3c_get_object_to_file(s3cClient* client,
     return res;
 }
 
+typedef struct {
+    s3cStreamCb cb;
+    void*       user_ctx;
+} StreamCbAdapter;
+
+static const char* fn_stream_write_cb(const char* bytes, size_t num_bytes,
+                                       StreamContext* c)
+{
+    StreamCbAdapter* adapter = c->opaque;
+    return adapter->cb(bytes, (uint64_t)num_bytes, adapter->user_ctx);
+}
+
+s3cReply* s3c_get_object_stream(s3cClient* client,
+                                const char* bucket, const char* object_key,
+                                s3cStreamCb cb, void* ctx)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
+        return err;
+    }
+
+    if (cb == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <cb>");
+    }
+
+    StreamCbAdapter adapter = { .cb = cb, .user_ctx = ctx };
+
+    StreamWrite stream_wr = {
+        .fn_write = &fn_stream_write_cb,
+        .ctx = {
+            .opaque = &adapter,
+            .confs = &client->confs,
+        }
+    };
+
+    OpArgs args = {
+        .bucket = bucket,
+        .object_key = object_key,
+        .stream_wr = &stream_wr,
+    };
+
+    return run_s3_op(client, "GET", args);
+}
+
 s3cReply* s3c_put_object(s3cClient* client,
                             const char* bucket, const char* object_key,
                             const uint8_t* data, uint64_t data_size,
@@ -977,6 +1026,169 @@ cleanup_and_ret:
     str_destroy(&iota_buf);
 
     return reply;
+}
+
+struct s3cMultipart {
+    s3cClient*  client;
+    char*       bucket;
+    char*       object_key;
+    char*       upload_id;
+    s3cKVL*     etags;
+    s3cKVL*     etags_tail;
+};
+
+void s3c_multipart_free(s3cMultipart* mp)
+{
+    if (mp == NULL) {
+        return;
+    }
+
+    free(mp->bucket);
+    free(mp->object_key);
+    free(mp->upload_id);
+    s3c_kvl_free(mp->etags);
+    free(mp);
+}
+
+s3cReply* s3c_multipart_init(s3cClient* client,
+                                 const char* bucket, const char* object_key,
+                                 const s3cKVL* headers,
+                                 s3cMultipart** out)
+{
+    *out = NULL;
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
+        return err;
+    }
+
+    StrBuf upload_id = str_init(128);
+
+    s3cReply* reply = s3c_multipart_upload_init(
+        client, bucket, object_key, headers, &upload_id
+    );
+
+    if (reply->error != NULL) {
+        str_destroy(&upload_id);
+        return reply;
+    }
+
+    s3cMultipart* mp = calloc(1, sizeof(s3cMultipart));
+    mp->client = client;
+    mp->bucket = str_dup(bucket);
+    mp->object_key = str_dup(object_key);
+    mp->upload_id = str_extract(&upload_id);
+
+    *out = mp;
+    return reply;
+}
+
+s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
+                                        uint64_t part_number,
+                                        const uint8_t* data, uint64_t data_size)
+{
+    if (mp == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <multipart>");
+    }
+
+    if (data == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <data>");
+    }
+
+    if (data_size < 1) {
+        return s3c_reply_alloc("provided arguments missing value for <data_size>");
+    }
+
+    if (part_number < 1 || part_number > 10000) {
+        return s3c_reply_alloc("<part_number> must be between 1 and 10000");
+    }
+
+    char part_num_str[21];
+    snprintf(part_num_str, sizeof(part_num_str), "%" PRIu64, part_number);
+
+    s3cKVL q_upload_id = {
+        .key = "uploadId",
+        .value = mp->upload_id,
+    };
+
+    s3cKVL q_part_num = {
+        .key = "partNumber",
+        .value = part_num_str,
+        .next = &q_upload_id,
+    };
+
+    StreamRead stream_rd = {
+        .fn_read = &fn_stream_read_mem,
+        .ctx = {
+            .opaque = (void*)data,
+            .total_size = data_size,
+            .confs = &mp->client->confs,
+        }
+    };
+
+    OpArgs args = {
+        .bucket = mp->bucket,
+        .object_key = mp->object_key,
+        .query_args = &q_part_num,
+        .stream_rd = &stream_rd,
+    };
+
+    s3cReply* reply = run_s3_op(mp->client, "PUT", args);
+
+    if (reply->error != NULL) {
+        return reply;
+    }
+
+    // collect etag for complete call
+    s3cKVL* etag = s3c_kvl_find(reply->headers, "ETag");
+
+    if (etag == NULL) {
+        free(reply->error);
+        reply->error = str_dup("S3 reply missing header ETag");
+        return reply;
+    }
+
+    s3cKVL* etag_copy = malloc(sizeof(s3cKVL));
+    etag_copy->key = str_dup(etag->key);
+    etag_copy->value = str_dup(etag->value);
+    etag_copy->next = NULL;
+
+    if (mp->etags == NULL) {
+        mp->etags = etag_copy;
+    } else {
+        mp->etags_tail->next = etag_copy;
+    }
+    mp->etags_tail = etag_copy;
+
+    return reply;
+}
+
+s3cReply* s3c_multipart_complete(s3cMultipart* mp)
+{
+    if (mp == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <multipart>");
+    }
+
+    return s3c_multipart_upload_finish(
+        mp->client, mp->bucket, mp->object_key,
+        mp->upload_id, mp->etags
+    );
+}
+
+s3cReply* s3c_multipart_abort(s3cMultipart* mp)
+{
+    if (mp == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <multipart>");
+    }
+
+    return s3c_multipart_upload_abort(
+        mp->client, mp->bucket, mp->object_key,
+        mp->upload_id
+    );
 }
 
 s3cReply* s3c_put_object_from_file(s3cClient* client,

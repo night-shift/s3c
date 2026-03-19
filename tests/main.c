@@ -8,9 +8,35 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <inttypes.h>
 
 const char* TEST_BUCKET = "s3c-tests";
 const char* LOCAL_OBJ_FILE = "tests/obj_file";
+
+typedef struct {
+    char*  buf;
+    size_t len;
+    size_t cap;
+} TestCbBuf;
+
+static const char* test_stream_cb(const char* bytes, uint64_t num_bytes, void* ctx)
+{
+    TestCbBuf* b = ctx;
+    if (b->len + num_bytes > b->cap) {
+        return "buffer overflow";
+    }
+    memcpy(b->buf + b->len, bytes, num_bytes);
+    b->len += num_bytes;
+    return NULL;
+}
+
+static const char* test_stream_cb_abort(const char* bytes, uint64_t num_bytes, void* ctx)
+{
+    (void)bytes;
+    (void)num_bytes;
+    (void)ctx;
+    return "aborted by user";
+}
 
 
 void log_info(const char* fmt_str, ...)
@@ -353,6 +379,12 @@ bool test_api_argument_validation(void)
 
     ok = expect_error_reply("get_object_to_file null file",
             s3c_get_object_to_file(client, "b", "k", NULL), "<file>") && ok;
+    ok = expect_error_reply("get_object_cb null client",
+            s3c_get_object_stream(NULL, "b", "k", (s3cStreamCb)1, NULL), "<client>") && ok;
+    ok = expect_error_reply("get_object_cb null bucket",
+            s3c_get_object_stream(client, NULL, "k", (s3cStreamCb)1, NULL), "<bucket>") && ok;
+    ok = expect_error_reply("get_object_cb null cb",
+            s3c_get_object_stream(client, "b", "k", NULL, NULL), "<cb>") && ok;
     ok = expect_error_reply("put_object null data",
             s3c_put_object(client, "b", "k", NULL, 1, NULL), "<data>") && ok;
     ok = expect_error_reply("put_object zero size",
@@ -405,6 +437,25 @@ bool test_api_argument_validation(void)
             s3c_generate_presigned_url(client, "b", "k", "GET", 0), "<expires_sec>") && ok;
     ok = expect_error_reply("presigned_url expires too large",
             s3c_generate_presigned_url(client, "b", "k", "GET", 604801), "<expires_sec>") && ok;
+
+    s3cMultipart* mp_dummy = NULL;
+    ok = expect_error_reply("multipart_init null client",
+            s3c_multipart_init(NULL, "b", "k", NULL, &mp_dummy), "<client>") && ok;
+    ok = expect_error_reply("multipart_init null bucket",
+            s3c_multipart_init(client, NULL, "k", NULL, &mp_dummy), "<bucket>") && ok;
+
+    uint8_t mp_byte = 1;
+    ok = expect_error_reply("multipart_upload_part null mp",
+            s3c_multipart_upload_part(NULL, 1, &mp_byte, 1), "<multipart>") && ok;
+    ok = expect_error_reply("multipart_upload_part null data",
+            s3c_multipart_upload_part((s3cMultipart*)&mp_byte, 1, NULL, 1), "<data>") && ok;
+    ok = expect_error_reply("multipart_upload_part bad part_number",
+            s3c_multipart_upload_part((s3cMultipart*)&mp_byte, 0, &mp_byte, 1), "<part_number>") && ok;
+
+    ok = expect_error_reply("multipart_complete null mp",
+            s3c_multipart_complete(NULL), "<multipart>") && ok;
+    ok = expect_error_reply("multipart_abort null mp",
+            s3c_multipart_abort(NULL), "<multipart>") && ok;
 
     s3c_client_free(client);
     return ok;
@@ -660,6 +711,128 @@ cleanup_and_ret:
 
     remove(LOCAL_OBJ_FILE);
     delete_test_bucket(client);
+
+    return all_good;
+}
+
+bool test_multipart_api(s3cClient* client)
+{
+    bool all_good = false;
+    s3cReply* reply = NULL;
+    s3cMultipart* mp = NULL;
+
+    const char* object_key = "mp-test/file.bin";
+
+    // S3 minimum part size is 5MB (except last part)
+    size_t part_size = 1024 * 1024 * 5;
+    size_t total_size = part_size * 2 + 1024; // 2 full parts + small last part
+
+    char* data = calloc(total_size, 1);
+    for (size_t i = 0; i < total_size; i++) {
+        data[i] = (char)(i % 251);
+    }
+
+    log_info("multipart api: setup...");
+
+    if (!create_test_bucket(client)) {
+        log_err("error: failed to create test bucket\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
+    log_info("multipart api: init...");
+
+    reply = s3c_multipart_init(client, TEST_BUCKET, object_key, NULL, &mp);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (mp == NULL) {
+        log_err("error: multipart context is NULL\n");
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    log_info("ok\n");
+
+    log_info("multipart api: upload parts...");
+
+    size_t offset = 0;
+    uint64_t part_num = 1;
+
+    while (offset < total_size) {
+        size_t chunk = total_size - offset;
+        if (chunk > part_size) {
+            chunk = part_size;
+        }
+
+        reply = s3c_multipart_upload_part(
+            mp, part_num, (const uint8_t*)data + offset, chunk
+        );
+
+        if (reply->error != NULL) {
+            log_err("error: part %" PRIu64 ": %s\n", part_num, reply->error);
+            goto cleanup_and_ret;
+        }
+
+        s3c_reply_free(reply);
+        reply = NULL;
+
+        offset += chunk;
+        part_num++;
+    }
+
+    log_info("ok (%d parts)\n", (int)(part_num - 1));
+
+    log_info("multipart api: complete...");
+
+    reply = s3c_multipart_complete(mp);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    log_info("ok\n");
+
+    log_info("multipart api: verify...");
+
+    reply = s3c_get_object(client, TEST_BUCKET, object_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->data_size != total_size ||
+        memcmp(data, reply->data, total_size) != 0) {
+        log_err("error: multipart uploaded content does not match, "
+                "sizes [%zu] / [%zu]\n",
+                (size_t)reply->data_size, total_size);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
+    all_good = true;
+
+cleanup_and_ret:
+    s3c_reply_free(reply);
+    s3c_multipart_free(mp);
+
+    s3cReply* del = s3c_delete_object(client, TEST_BUCKET, object_key);
+    s3c_reply_free(del);
+
+    delete_test_bucket(client);
+    free(data);
 
     return all_good;
 }
@@ -955,6 +1128,52 @@ bool run_basic_tests(s3cClient* client)
 
     log_info("ok resp code => %d\n", (int)reply->http_resp_code);
 
+    log_info("get object via callback...");
+    s3c_reply_free(reply);
+
+    TestCbBuf cb_buf = {
+        .buf = calloc(rt_data_size + 1, 1),
+        .len = 0,
+        .cap = rt_data_size + 1,
+    };
+
+    reply = s3c_get_object_stream(client, TEST_BUCKET, object_key,
+                               test_stream_cb, &cb_buf);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        free(cb_buf.buf);
+        goto cleanup_and_ret;
+    }
+
+    if (cb_buf.len != rt_data_size ||
+        memcmp(cb_buf.buf, rt_data, rt_data_size) != 0) {
+        log_err("error: callback data does not match original\n");
+        free(cb_buf.buf);
+        goto cleanup_and_ret;
+    }
+
+    free(cb_buf.buf);
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    log_info("get object via callback abort...");
+    s3c_reply_free(reply);
+
+    reply = s3c_get_object_stream(client, TEST_BUCKET, object_key,
+                               test_stream_cb_abort, NULL);
+
+    if (reply->error == NULL) {
+        log_err("error: expected error from aborted callback\n");
+        goto cleanup_and_ret;
+    }
+
+    if (strstr(reply->error, "aborted by user") == NULL) {
+        log_err("error: expected 'aborted by user' in error, got: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
     log_info("head object...");
     s3c_reply_free(reply);
     reply = s3c_head_object(client, TEST_BUCKET, object_key);
@@ -1198,6 +1417,11 @@ int main(int argc, const char** argv)
     }
 
     ok = test_big_object(client);
+    if (!ok) {
+        ret_code = 1;
+    }
+
+    ok = test_multipart_api(client);
     if (!ok) {
         ret_code = 1;
     }

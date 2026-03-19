@@ -81,6 +81,16 @@ s3cReply* s3c_get_object_to_file(s3cClient* client,
                                  const char* bucket, const char* object_key,
                                  const char* file);
 
+// Stream callback for s3c_get_object_stream.
+// Called with each chunk of the response body.
+// Return NULL on success, or an error string to abort the transfer.
+// The error string is copied internally and does not need to outlive the callback.
+typedef const char* (*s3cStreamCb)(const char* bytes, uint64_t num_bytes, void* ctx);
+
+s3cReply* s3c_get_object_stream(s3cClient* client,
+                                 const char* bucket, const char* object_key,
+                                 s3cStreamCb cb, void* ctx);
+
 s3cReply* s3c_put_object_from_file(s3cClient* client,
                                    const char* bucket, const char* object_key,
                                    const char* file,
@@ -128,6 +138,24 @@ typedef struct {
 s3cReply* s3c_list_objects(s3cClient* client,
                            const char* bucket,
                            const s3cListObjectsOpts* opts);
+
+
+typedef struct s3cMultipart s3cMultipart;
+
+s3cReply* s3c_multipart_init(s3cClient* client,
+                             const char* bucket, const char* object_key,
+                             const s3cKVL* headers,
+                             s3cMultipart** out);
+
+s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
+                                    uint64_t part_number,
+                                    const uint8_t* data, uint64_t data_size);
+
+s3cReply* s3c_multipart_complete(s3cMultipart* mp);
+
+s3cReply* s3c_multipart_abort(s3cMultipart* mp);
+
+void s3c_multipart_free(s3cMultipart* mp);
 
 
 void s3c_kvl_ins(s3cKVL** head_ref, const char* name, const char* value);
