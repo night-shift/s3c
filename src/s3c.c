@@ -1548,7 +1548,7 @@ static s3cReply* list_objects_page(s3cClient* client,
 
     s3c_kvl_ins(&query_args, "list-type", "2");
 
-    if (opts != NULL) {
+    if (opts != NULL && opts->max_keys > 0) {
         char max_keys_str[21];
         snprintf(max_keys_str, sizeof(max_keys_str), "%" PRIu64, opts->max_keys);
         s3c_kvl_ins(&query_args, "max-keys", max_keys_str);

@@ -927,6 +927,25 @@ bool test_list_objects(s3cClient* client)
     s3c_reply_free(reply);
     reply = NULL;
 
+    log_info("list objects: max_keys=0 (default)...");
+
+    s3cListObjectsOpts default_opts = { .prefix = "list-test/", .max_keys = 0 };
+    reply = s3c_list_objects(client, TEST_BUCKET, &default_opts);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->result.list.entries == NULL) {
+        log_err("error: max_keys=0 should use S3 default, got no entries\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+    s3c_reply_free(reply);
+    reply = NULL;
+
     log_info("list objects: max_keys=1...");
 
     s3cListObjectsOpts max_keys_opts = { .max_keys = 1 };
