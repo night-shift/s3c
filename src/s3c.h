@@ -24,12 +24,35 @@ typedef struct s3cKVL {
     struct s3cKVL* next;
 } s3cKVL;
 
+typedef struct s3cListEntry {
+    char*    key;
+    char*    etag;
+    char*    last_modified;
+    uint64_t size;
+    struct s3cListEntry* next;
+} s3cListEntry;
+
+typedef struct {
+    s3cListEntry* entries;
+    char*         continuation_token;
+    uint8_t       is_truncated; // boolean
+} s3cListResult;
+
+typedef enum {
+    S3C_RESULT_RAW = 0,
+    S3C_RESULT_LIST,
+} s3cResultKind;
+
 typedef struct {
     char*    error;
     s3cKVL*  headers;
     uint8_t* data;
     uint64_t data_size;
     uint64_t http_resp_code;
+    s3cResultKind result_kind;
+    union {
+        s3cListResult list;
+    } result;
 } s3cReply;
 
 typedef struct s3cClient s3cClient;
@@ -74,6 +97,17 @@ s3cReply* s3c_put_object_from_file_multipart(s3cClient* client,
                                              const s3cKVL* headers,
                                              const s3cMultipartOpts* opts);
 
+s3cReply* s3c_head_object(s3cClient* client,
+                          const char* bucket, const char* object_key);
+
+s3cReply* s3c_copy_object(s3cClient* client,
+                          const char* src_bucket, const char* src_key,
+                          const char* dst_bucket, const char* dst_key);
+
+s3cReply* s3c_generate_presigned_url(s3cClient* client,
+                                     const char* bucket, const char* object_key,
+                                     const char* method, uint64_t expires_sec);
+
 s3cReply* s3c_delete_object(s3cClient* client,
                             const char* bucket, const char* object_key);
 
@@ -81,6 +115,19 @@ s3cReply* s3c_create_bucket(s3cClient* client,
                             const char* bucket, const s3cKVL* headers);
 
 s3cReply* s3c_delete_bucket(s3cClient* client, const char* bucket);
+
+typedef struct {
+    const char* prefix;
+    const char* delimiter;
+    const char* start_after;
+    const char* continuation_token;
+    uint64_t    max_keys;
+    uint8_t     fetch_all; // boolean
+} s3cListObjectsOpts;
+
+s3cReply* s3c_list_objects(s3cClient* client,
+                           const char* bucket,
+                           const s3cListObjectsOpts* opts);
 
 
 void s3c_kvl_ins(s3cKVL** head_ref, const char* name, const char* value);
@@ -99,6 +146,8 @@ void s3c_reply_free(s3cReply*);
 
 
 void s3c_kvl_free(s3cKVL*);
+
+void s3c_list_entry_free(s3cListEntry*);
 
 
 #ifdef __cplusplus

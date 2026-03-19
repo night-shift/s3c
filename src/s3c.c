@@ -190,6 +190,18 @@ s3cReply* s3c_reply_alloc(const char* error)
     return reply;
 }
 
+void s3c_list_entry_free(s3cListEntry* entry)
+{
+    while (entry != NULL) {
+        s3cListEntry* next = entry->next;
+        free(entry->key);
+        free(entry->etag);
+        free(entry->last_modified);
+        free(entry);
+        entry = next;
+    }
+}
+
 void s3c_reply_free(s3cReply* reply)
 {
     if (reply == NULL) {
@@ -200,6 +212,15 @@ void s3c_reply_free(s3cReply* reply)
 
     free(reply->error);
     free(reply->data);
+
+    switch (reply->result_kind) {
+    case S3C_RESULT_LIST:
+        s3c_list_entry_free(reply->result.list.entries);
+        free(reply->result.list.continuation_token);
+        break;
+    default:
+        break;
+    }
 
     free(reply);
 }
@@ -1028,10 +1049,10 @@ cleanup_and_ret:
 }
 
 s3cReply* s3c_put_object_from_file_multipart(s3cClient* client,
-                                                const char* bucket, const char* object_key,
-                                                const char* file,
-                                                const s3cKVL* headers,
-                                                const s3cMultipartOpts* opts)
+                                             const char* bucket, const char* object_key,
+                                             const char* file,
+                                             const s3cKVL* headers,
+                                             const s3cMultipartOpts* opts)
 {
     s3cMultipartOpts default_opts = {
         .part_size = 6 * 1024 * 1024,
@@ -1098,6 +1119,70 @@ cleanup_and_ret:
         fclose(fp);
     }
     str_destroy(&upload_id);
+
+    return reply;
+}
+
+s3cReply* s3c_head_object(s3cClient* client,
+                             const char* bucket, const char* object_key)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
+        return err;
+    }
+
+    OpArgs args = {
+        .bucket = bucket,
+        .object_key = object_key,
+    };
+
+    return run_s3_op(client, "HEAD", args);
+}
+
+s3cReply* s3c_copy_object(s3cClient* client,
+                              const char* src_bucket, const char* src_key,
+                              const char* dst_bucket, const char* dst_key)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_str(src_bucket, "src_bucket")) != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_str(src_key, "src_key")) != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_bucket_key(dst_bucket, dst_key)) != NULL) {
+        return err;
+    }
+
+    StrBuf copy_source = str_init(strlen(src_bucket) + strlen(src_key) + 2);
+    str_push_many(&copy_source, "/", src_bucket, "/", src_key, NULL);
+
+    s3cKVL copy_header = {
+        .key = "x-amz-copy-source",
+        .value = copy_source.ptr,
+    };
+
+    OpArgs args = {
+        .bucket = dst_bucket,
+        .object_key = dst_key,
+        .headers = &copy_header,
+    };
+
+    s3cReply* reply = run_s3_op(client, "PUT", args);
+
+    str_destroy(&copy_source);
 
     return reply;
 }
@@ -1176,6 +1261,188 @@ s3cReply* s3c_delete_bucket(s3cClient* client, const char* bucket)
     };
 
     return run_s3_op(client, "DELETE", args);
+}
+
+static void parse_list_objects_xml(const char* xml, s3cListResult* out)
+{
+    StrBuf tag_buf = str_init(256);
+
+    parse_xml_tag(xml, "IsTruncated", &tag_buf);
+    out->is_truncated = tag_buf.len > 0 && strcmp(tag_buf.ptr, "true") == 0;
+
+    parse_xml_tag(xml, "NextContinuationToken", &tag_buf);
+    out->continuation_token = tag_buf.len > 0 ? str_dup(tag_buf.ptr) : NULL;
+
+    s3cListEntry* tail = NULL;
+    const char* cursor = xml;
+    StrBuf field = str_init(128);
+
+    while ((cursor = strstr(cursor, "<Contents>")) != NULL) {
+        const char* block_start = cursor + strlen("<Contents>");
+        const char* block_end = strstr(block_start, "</Contents>");
+
+        if (block_end == NULL) {
+            break;
+        }
+
+        size_t block_len = (size_t)(block_end - cursor) + strlen("</Contents>");
+        str_set(&tag_buf, "");
+        str_push(&tag_buf, cursor, block_len);
+
+        s3cListEntry* entry = calloc(1, sizeof(s3cListEntry));
+
+        parse_xml_tag(tag_buf.ptr, "Key", &field);
+        entry->key = field.len > 0 ? str_dup(field.ptr) : NULL;
+
+        parse_xml_tag(tag_buf.ptr, "ETag", &field);
+        entry->etag = field.len > 0 ? str_dup(field.ptr) : NULL;
+
+        parse_xml_tag(tag_buf.ptr, "LastModified", &field);
+        entry->last_modified = field.len > 0 ? str_dup(field.ptr) : NULL;
+
+        parse_xml_tag(tag_buf.ptr, "Size", &field);
+        entry->size = field.len > 0 ? (uint64_t)strtoull(field.ptr, NULL, 10) : 0;
+
+        if (tail == NULL) {
+            out->entries = entry;
+        } else {
+            tail->next = entry;
+        }
+        tail = entry;
+
+        cursor = block_end + strlen("</Contents>");
+    }
+
+    str_destroy(&field);
+    str_destroy(&tag_buf);
+}
+
+static s3cReply* list_objects_page(s3cClient* client,
+                                   const char* bucket,
+                                   const s3cListObjectsOpts* opts,
+                                   const char* continuation_token)
+{
+    s3cKVL* query_args = NULL;
+
+    if (continuation_token != NULL && *continuation_token != '\0') {
+        s3c_kvl_ins(&query_args, "continuation-token", continuation_token);
+    } else if (opts != NULL && opts->continuation_token != NULL && *opts->continuation_token != '\0') {
+        s3c_kvl_ins(&query_args, "continuation-token", opts->continuation_token);
+    }
+
+    if (opts != NULL && opts->delimiter != NULL && *opts->delimiter != '\0') {
+        s3c_kvl_ins(&query_args, "delimiter", opts->delimiter);
+    }
+
+    s3c_kvl_ins(&query_args, "list-type", "2");
+
+    if (opts != NULL) {
+        char max_keys_str[21];
+        snprintf(max_keys_str, sizeof(max_keys_str), "%" PRIu64, opts->max_keys);
+        s3c_kvl_ins(&query_args, "max-keys", max_keys_str);
+    }
+
+    if (opts != NULL && opts->prefix != NULL && *opts->prefix != '\0') {
+        s3c_kvl_ins(&query_args, "prefix", opts->prefix);
+    }
+
+    if (opts != NULL && opts->start_after != NULL && *opts->start_after != '\0') {
+        s3c_kvl_ins(&query_args, "start-after", opts->start_after);
+    }
+
+    StrBuf res_buf = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
+
+    StreamWrite stream_wr = {
+        .fn_write = &fn_stream_write_str_buf,
+        .ctx = {
+            .opaque = &res_buf,
+            .confs = &client->confs,
+        }
+    };
+
+    OpArgs args = {
+        .bucket = bucket,
+        .query_args = query_args,
+        .stream_wr = &stream_wr,
+    };
+
+    s3cReply* reply = run_s3_op(client, "GET", args);
+
+    if (reply->error == NULL) {
+        reply->result_kind = S3C_RESULT_LIST;
+        parse_list_objects_xml(res_buf.ptr, &reply->result.list);
+    }
+
+    str_destroy(&res_buf);
+    s3c_kvl_free(query_args);
+
+    return reply;
+}
+
+s3cReply* s3c_list_objects(s3cClient* client,
+                              const char* bucket,
+                              const s3cListObjectsOpts* opts)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_str(bucket, "bucket")) != NULL) {
+        return err;
+    }
+
+    s3cReply* reply = list_objects_page(client, bucket, opts, NULL);
+
+    if (reply->error != NULL || opts == NULL || !opts->fetch_all) {
+        return reply;
+    }
+
+    // auto-paginate: append entries from subsequent pages
+    s3cListEntry* tail = reply->result.list.entries;
+    while (tail != NULL && tail->next != NULL) {
+        tail = tail->next;
+    }
+
+    while (reply->result.list.is_truncated &&
+           reply->result.list.continuation_token != NULL) {
+
+        s3cReply* page = list_objects_page(
+            client, bucket, opts,
+            reply->result.list.continuation_token
+        );
+
+        if (page->error != NULL) {
+            // return the error page, discard accumulated results
+            s3c_reply_free(reply);
+            return page;
+        }
+
+        // steal entries from page and append to reply
+        if (page->result.list.entries != NULL) {
+            if (tail == NULL) {
+                reply->result.list.entries = page->result.list.entries;
+            } else {
+                tail->next = page->result.list.entries;
+            }
+            // advance tail to end of new entries
+            while (tail != NULL && tail->next != NULL) {
+                tail = tail->next;
+            }
+            page->result.list.entries = NULL;
+        }
+
+        // update continuation state from latest page
+        free(reply->result.list.continuation_token);
+        reply->result.list.continuation_token = page->result.list.continuation_token;
+        reply->result.list.is_truncated = page->result.list.is_truncated;
+        page->result.list.continuation_token = NULL;
+
+        s3c_reply_free(page);
+    }
+
+    return reply;
 }
 
 static void set_date_stamps(DateStamps* dates)
@@ -1336,10 +1603,9 @@ static void gen_sig_header_entries(s3cKVL* headers_in,
     str_destroy(&sbuf);
 }
 
-static void append_s3_escaped_string(StrBuf* str_buf, const char* str)
+static void append_pct_encoded(StrBuf* str_buf, const char* str,
+                               const char* legal_chars, size_t legal_len)
 {
-    const char legal_chars[] = "/-_.";
-
     const char* hex_lk = "0123456789ABCDEF";
 
     for (size_t i = 0; i < strlen(str); i++) {
@@ -1348,7 +1614,7 @@ static void append_s3_escaped_string(StrBuf* str_buf, const char* str)
                          (c < 'A' || c > 'Z') &&
                          (c < 'a' || c > 'z');
         // except legal chars
-        for (size_t j = 0; do_escape && j < sizeof(legal_chars) - 1; j++) {
+        for (size_t j = 0; do_escape && j < legal_len; j++) {
             do_escape = c != legal_chars[j];
         }
 
@@ -1361,6 +1627,18 @@ static void append_s3_escaped_string(StrBuf* str_buf, const char* str)
         str_push_char(str_buf, hex_lk[(c >> 4) & 0x0F]);
         str_push_char(str_buf, hex_lk[c & 0x0F]);
     }
+}
+
+static void append_s3_escaped_string(StrBuf* str_buf, const char* str)
+{
+    const char legal_chars[] = "/-_.";
+    append_pct_encoded(str_buf, str, legal_chars, sizeof(legal_chars) - 1);
+}
+
+static void append_uri_query_value(StrBuf* str_buf, const char* str)
+{
+    const char legal_chars[] = "-._~";
+    append_pct_encoded(str_buf, str, legal_chars, sizeof(legal_chars) - 1);
 }
 
 static void bytes_to_hex(const uint8_t* bytes, size_t num_bytes, char* hex_out)
@@ -1596,6 +1874,129 @@ cleanup_and_ret:
     return gen_ok;
 }
 
+s3cReply* s3c_generate_presigned_url(s3cClient* client,
+                                     const char* bucket, const char* object_key,
+                                     const char* method, uint64_t expires_sec)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_str(method, "method")) != NULL) {
+        return err;
+    }
+
+    if (expires_sec < 1 || expires_sec > 604800) {
+        return s3c_reply_alloc("presigned url <expires_sec> must be between 1 and 604800");
+    }
+
+    DateStamps dates;
+    set_date_stamps(&dates);
+
+    StrBuf endpoint    = get_req_host(client);
+    StrBuf scope       = gen_scope_string(dates.date, client->keys.region);
+    StrBuf sig_url     = str_init(128);
+    StrBuf query_str   = str_init(256);
+    StrBuf request_sig = str_init(256);
+    StrBuf sts         = str_init(256);
+
+    // build canonical URI: /<bucket>/<key>
+    str_push_char(&sig_url, '/');
+    append_s3_escaped_string(&sig_url, bucket);
+    str_push_char(&sig_url, '/');
+    append_s3_escaped_string(&sig_url, object_key);
+
+    // build credential
+    StrBuf credential = str_init(128);
+    str_push_many(&credential,
+        client->keys.access_key_id, "/", scope.ptr,
+        NULL
+    );
+
+    // build canonical query string (params must be sorted)
+    StrBuf encoded_cred = str_init(128);
+    append_uri_query_value(&encoded_cred, credential.ptr);
+
+    char expires_str[21];
+    snprintf(expires_str, sizeof(expires_str), "%" PRIu64, expires_sec);
+
+    str_push_many(&query_str,
+        "X-Amz-Algorithm=", S3_SIGNATURE_ALGO,
+        "&X-Amz-Credential=", encoded_cred.ptr,
+        "&X-Amz-Date=", dates.date_time,
+        "&X-Amz-Expires=", expires_str,
+        "&X-Amz-SignedHeaders=host",
+        NULL
+    );
+
+    // canonical request
+    str_push_many(&request_sig,
+        method, "\n",
+        sig_url.ptr, "\n",
+        query_str.ptr, "\n",
+        "host:", endpoint.ptr, "\n",
+        "\n",
+        "host\n",
+        "UNSIGNED-PAYLOAD",
+        NULL
+    );
+
+    // string to sign
+    bool gen_ok = gen_string_to_sign(&request_sig, &scope, dates.date_time, &sts);
+
+    uint8_t signing_key[S3C_SHA256_BIN_SIZE];
+    gen_ok = gen_ok && gen_signing_key(&client->keys, dates.date, signing_key);
+
+    uint8_t signature_bin[S3C_SHA256_BIN_SIZE];
+    gen_ok = gen_ok && hmac_sha256_from_bytes(
+        signing_key, S3C_SHA256_BIN_SIZE,
+        (const uint8_t*)sts.ptr, sts.len,
+        signature_bin
+    );
+
+    s3cReply* reply = NULL;
+
+    if (!gen_ok) {
+        reply = s3c_reply_alloc("presigned url signature generation failed");
+        goto cleanup_and_ret;
+    }
+
+    char signature_hex[S3C_SHA256_HEX_SIZE + 1] = {'\0'};
+    bytes_to_hex(signature_bin, S3C_SHA256_BIN_SIZE, signature_hex);
+
+    // build final URL
+    StrBuf url = str_init(512);
+    str_push_many(&url,
+        "https://", endpoint.ptr,
+        sig_url.ptr,
+        "?", query_str.ptr,
+        "&X-Amz-Signature=", signature_hex,
+        NULL
+    );
+
+    reply = s3c_reply_alloc(NULL);
+    reply->data = (uint8_t*)str_extract(&url);
+    reply->data_size = strlen((char*)reply->data);
+
+cleanup_and_ret:
+    str_destroy(&endpoint);
+    str_destroy(&scope);
+    str_destroy(&sig_url);
+    str_destroy(&query_str);
+    str_destroy(&request_sig);
+    str_destroy(&sts);
+    str_destroy(&credential);
+    str_destroy(&encoded_cred);
+
+    return reply;
+}
+
 static void op_run_request(OpContext* op, const char* html_verb)
 {
     uint32_t max_cap_reserve_mb = op->client->confs.str_buf_max_cap_reserve_mb;
@@ -1621,11 +2022,12 @@ static void op_run_request(OpContext* op, const char* html_verb)
 
     // asserting query args are sorted
     for (const s3cKVL* h = op->args.query_args; h; h = h->next) {
-        str_push_many(
-            &query_str, h->key, "=", h->value,
-            (h->next ? "&" : ""),
-            NULL
-        );
+        append_uri_query_value(&query_str, h->key);
+        str_push_char(&query_str, '=');
+        append_uri_query_value(&query_str, h->value);
+        if (h->next) {
+            str_push_char(&query_str, '&');
+        }
     }
 
     s3c_kvl_upsert(&headers, "host", endpoint.ptr);

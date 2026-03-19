@@ -30,6 +30,8 @@ print:
 
 static: print $(lib).a
 
+shared: print $(lib).so
+
 $(out_dir)/tests: $(lib).a $(test_objs)
 	@$(CC) $(CCFLAGS) -o $(out_dir)/tests $(test_objs) $(lib).a $(link_libs)
 
@@ -53,6 +55,10 @@ clean:
 $(lib).a: $(lib_objs)
 	@echo "\tpacking $(lib).a"
 	@$(AR) rcs $(lib).a $(lib_objs)
+
+$(lib).so: $(lib_objs)
+	@echo "\tlinking $(lib).so"
+	@$(CC) -shared -o $(lib).so $(lib_objs) $(link_libs)
 
 $(cache)/%.o: %.c
 	@echo "\tcompile $@"

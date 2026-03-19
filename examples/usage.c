@@ -109,6 +109,20 @@ int main(int argc, char** argv)
     // Freeing the reply object also frees the reply data and headers
     s3c_reply_free(reply);
 
+    // List objects in the bucket
+    s3cListObjectsOpts list_opts = { .prefix = "fruits", .max_keys = 10 };
+    reply = s3c_list_objects(client, s3_bucket, &list_opts);
+
+    if (reply->error != NULL) {
+        printf("s3c_list_objects failed with error => %s\n", reply->error);
+    } else {
+        for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+            printf("  %s (size: %lu)\n", e->key, (unsigned long)e->size);
+        }
+    }
+
+    s3c_reply_free(reply);
+
     // Delete fruits.txt
     reply = s3c_delete_object(client, s3_bucket, object_key);
 

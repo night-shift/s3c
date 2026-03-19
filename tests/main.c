@@ -363,12 +363,48 @@ bool test_api_argument_validation(void)
     ok = expect_error_reply("put_object_from_file_multipart null file",
             s3c_put_object_from_file_multipart(client, "b", "k", NULL, NULL, NULL), "<file>") && ok;
 
+    ok = expect_error_reply("head_object null client",
+            s3c_head_object(NULL, "b", "k"), "<client>") && ok;
+    ok = expect_error_reply("head_object null bucket",
+            s3c_head_object(client, NULL, "k"), "<bucket>") && ok;
+    ok = expect_error_reply("head_object null object_key",
+            s3c_head_object(client, "b", NULL), "<object_key>") && ok;
+
+    ok = expect_error_reply("copy_object null client",
+            s3c_copy_object(NULL, "b", "k", "b", "k"), "<client>") && ok;
+    ok = expect_error_reply("copy_object null src_bucket",
+            s3c_copy_object(client, NULL, "k", "b", "k"), "<src_bucket>") && ok;
+    ok = expect_error_reply("copy_object null src_key",
+            s3c_copy_object(client, "b", NULL, "b", "k"), "<src_key>") && ok;
+    ok = expect_error_reply("copy_object null dst_bucket",
+            s3c_copy_object(client, "b", "k", NULL, "k"), "<bucket>") && ok;
+    ok = expect_error_reply("copy_object null dst_key",
+            s3c_copy_object(client, "b", "k", "b", NULL), "<object_key>") && ok;
+
     ok = expect_error_reply("delete_object null bucket",
             s3c_delete_object(client, NULL, "k"), "<bucket>") && ok;
     ok = expect_error_reply("create_bucket null bucket",
             s3c_create_bucket(client, NULL, NULL), "<bucket>") && ok;
     ok = expect_error_reply("delete_bucket null bucket",
             s3c_delete_bucket(client, NULL), "<bucket>") && ok;
+
+    ok = expect_error_reply("list_objects null client",
+            s3c_list_objects(NULL, "b", NULL), "<client>") && ok;
+    ok = expect_error_reply("list_objects null bucket",
+            s3c_list_objects(client, NULL, NULL), "<bucket>") && ok;
+
+    ok = expect_error_reply("presigned_url null client",
+            s3c_generate_presigned_url(NULL, "b", "k", "GET", 3600), "<client>") && ok;
+    ok = expect_error_reply("presigned_url null bucket",
+            s3c_generate_presigned_url(client, NULL, "k", "GET", 3600), "<bucket>") && ok;
+    ok = expect_error_reply("presigned_url null key",
+            s3c_generate_presigned_url(client, "b", NULL, "GET", 3600), "<object_key>") && ok;
+    ok = expect_error_reply("presigned_url null method",
+            s3c_generate_presigned_url(client, "b", "k", NULL, 3600), "<method>") && ok;
+    ok = expect_error_reply("presigned_url zero expires",
+            s3c_generate_presigned_url(client, "b", "k", "GET", 0), "<expires_sec>") && ok;
+    ok = expect_error_reply("presigned_url expires too large",
+            s3c_generate_presigned_url(client, "b", "k", "GET", 604801), "<expires_sec>") && ok;
 
     s3c_client_free(client);
     return ok;
@@ -628,6 +664,223 @@ cleanup_and_ret:
     return all_good;
 }
 
+bool test_list_objects(s3cClient* client)
+{
+    bool all_good = false;
+    s3cReply* reply = NULL;
+
+    const char* keys[] = {
+        "list-test/a.txt",
+        "list-test/b.txt",
+        "list-test/c.txt",
+    };
+    const int nkeys = 3;
+    const char* payload = "x";
+
+    log_info("list objects: setup...");
+
+    if (!create_test_bucket(client)) {
+        log_err("error: failed to create test bucket\n");
+        goto cleanup_and_ret;
+    }
+
+    for (int i = 0; i < nkeys; i++) {
+        reply = s3c_put_object(client, TEST_BUCKET, keys[i],
+                               (const uint8_t*)payload, 1, NULL);
+        if (reply->error != NULL) {
+            log_err("error: failed to put object '%s': %s\n", keys[i], reply->error);
+            s3c_reply_free(reply);
+            reply = NULL;
+            goto cleanup_and_ret;
+        }
+        s3c_reply_free(reply);
+        reply = NULL;
+    }
+
+    log_info("ok\n");
+
+    log_info("list objects: no opts...");
+
+    reply = s3c_list_objects(client, TEST_BUCKET, NULL);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    for (int i = 0; i < nkeys; i++) {
+        bool found = false;
+        for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+            if (strcmp(e->key, keys[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            log_err("error: key '%s' not found in list response\n", keys[i]);
+            goto cleanup_and_ret;
+        }
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    log_info("list objects: prefix filter...");
+
+    s3cListObjectsOpts prefix_opts = { .prefix = "list-test/", .max_keys = 10 };
+    reply = s3c_list_objects(client, TEST_BUCKET, &prefix_opts);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    for (int i = 0; i < nkeys; i++) {
+        bool found = false;
+        for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+            if (strcmp(e->key, keys[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            log_err("error: key '%s' not found in prefix-filtered response\n", keys[i]);
+            goto cleanup_and_ret;
+        }
+    }
+
+    log_info("ok\n");
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    log_info("list objects: max_keys=1...");
+
+    s3cListObjectsOpts max_keys_opts = { .max_keys = 1 };
+    reply = s3c_list_objects(client, TEST_BUCKET, &max_keys_opts);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3cListEntry* entries = reply->result.list.entries;
+
+    if (entries == NULL) {
+        log_err("error: expected at least one entry with max_keys=1\n");
+        goto cleanup_and_ret;
+    }
+
+    if (entries->next != NULL) {
+        log_err("error: expected only one entry with max_keys=1 but got more\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
+    log_info("list objects: continuation token...");
+
+    if (!reply->result.list.is_truncated || reply->result.list.continuation_token == NULL) {
+        log_err("error: expected truncated response with continuation token\n");
+        goto cleanup_and_ret;
+    }
+
+    const char* first_key = entries->key;
+
+    s3cListObjectsOpts cont_opts = {
+        .max_keys = 1,
+        .continuation_token = reply->result.list.continuation_token,
+    };
+
+    s3cReply* cont_reply = s3c_list_objects(client, TEST_BUCKET, &cont_opts);
+
+    if (cont_reply->error != NULL) {
+        log_err("error: %s\n", cont_reply->error);
+        s3c_reply_free(cont_reply);
+        goto cleanup_and_ret;
+    }
+
+    s3cListEntry* cont_entries = cont_reply->result.list.entries;
+
+    if (cont_entries == NULL) {
+        log_err("error: no entries in continuation page\n");
+        s3c_reply_free(cont_reply);
+        goto cleanup_and_ret;
+    }
+
+    if (cont_entries->next != NULL) {
+        log_err("error: expected one entry in continuation page but got more\n");
+        s3c_reply_free(cont_reply);
+        goto cleanup_and_ret;
+    }
+
+    if (strcmp(first_key, cont_entries->key) == 0) {
+        log_err("error: continuation page returned same key as first page\n");
+        s3c_reply_free(cont_reply);
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(cont_reply);
+    log_info("ok\n");
+
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    log_info("list objects: fetch_all...");
+
+    s3cListObjectsOpts fetch_all_opts = {
+        .prefix = "list-test/",
+        .max_keys = 1,
+        .fetch_all = true,
+    };
+    reply = s3c_list_objects(client, TEST_BUCKET, &fetch_all_opts);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    int entry_count = 0;
+    for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+        entry_count++;
+    }
+
+    if (entry_count != nkeys) {
+        log_err("error: fetch_all returned %d entries, expected %d\n", entry_count, nkeys);
+        goto cleanup_and_ret;
+    }
+
+    for (int i = 0; i < nkeys; i++) {
+        bool found = false;
+        for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+            if (strcmp(e->key, keys[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            log_err("error: key '%s' not found in fetch_all response\n", keys[i]);
+            goto cleanup_and_ret;
+        }
+    }
+
+    log_info("ok\n");
+
+    all_good = true;
+
+cleanup_and_ret:
+    s3c_reply_free(reply);
+
+    for (int i = 0; i < nkeys; i++) {
+        s3cReply* del = s3c_delete_object(client, TEST_BUCKET, keys[i]);
+        s3c_reply_free(del);
+    }
+
+    delete_test_bucket(client);
+
+    return all_good;
+}
+
 bool run_basic_tests(s3cClient* client)
 {
     s3cReply* reply = NULL;
@@ -701,6 +954,132 @@ bool run_basic_tests(s3cClient* client)
     }
 
     log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    log_info("head object...");
+    s3c_reply_free(reply);
+    reply = s3c_head_object(client, TEST_BUCKET, object_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3cKVL* head_ct = s3c_kvl_find(reply->headers, "content-type");
+    if (head_ct == NULL || strcmp(head_ct->value, rt_content_type) != 0) {
+        log_err("error: head object content-type does not match\n");
+        goto cleanup_and_ret;
+    }
+
+    s3cKVL* head_cl = s3c_kvl_find(reply->headers, "content-length");
+    if (head_cl == NULL) {
+        log_err("error: head object missing content-length\n");
+        goto cleanup_and_ret;
+    }
+
+    if (reply->data_size != 0) {
+        log_err("error: head object should have no body, got %zu bytes\n",
+                (size_t)reply->data_size);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    const char* copy_key = "test/file-copy.bin";
+
+    log_info("copy object...");
+    s3c_reply_free(reply);
+    reply = s3c_copy_object(client, TEST_BUCKET, object_key,
+                            TEST_BUCKET, copy_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    log_info("verify copy...");
+    s3c_reply_free(reply);
+    reply = s3c_get_object(client, TEST_BUCKET, copy_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->data_size != rt_data_size ||
+        memcmp(rt_data, reply->data, reply->data_size) != 0) {
+        log_err("error: copied object content does not match original\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
+    log_info("delete copy...");
+    s3c_reply_free(reply);
+    reply = s3c_delete_object(client, TEST_BUCKET, copy_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    log_info("presigned url...");
+    s3c_reply_free(reply);
+    reply = s3c_generate_presigned_url(client, TEST_BUCKET, object_key, "GET", 3600);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->data == NULL || reply->data_size == 0) {
+        log_err("error: presigned url is empty\n");
+        goto cleanup_and_ret;
+    }
+
+    if (strstr((char*)reply->data, "https://") != (char*)reply->data) {
+        log_err("error: presigned url does not start with https://\n");
+        goto cleanup_and_ret;
+    }
+
+    if (strstr((char*)reply->data, "X-Amz-Signature=") == NULL) {
+        log_err("error: presigned url missing X-Amz-Signature\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
+    log_info("presigned url: curl fetch...");
+    {
+        char cmd[2048];
+        snprintf(cmd, sizeof(cmd),
+                 "curl -sf -o tests/obj_file '%s'", (char*)reply->data);
+
+        int curl_ret = system(cmd);
+        if (curl_ret != 0) {
+            log_err("error: curl fetch failed with exit code %d\n", curl_ret);
+            goto cleanup_and_ret;
+        }
+
+        char* fetched = NULL;
+        size_t fetched_sz = 0;
+        read_file(LOCAL_OBJ_FILE, &fetched, &fetched_sz);
+
+        if (fetched_sz != rt_data_size ||
+            memcmp(fetched, rt_data, rt_data_size) != 0) {
+            log_err("error: presigned url fetched content does not match original\n");
+            free(fetched);
+            goto cleanup_and_ret;
+        }
+
+        free(fetched);
+        remove(LOCAL_OBJ_FILE);
+    }
+
+    log_info("ok\n");
 
     log_info("fetching object to file...");
 
@@ -819,6 +1198,11 @@ int main(int argc, const char** argv)
     }
 
     ok = test_big_object(client);
+    if (!ok) {
+        ret_code = 1;
+    }
+
+    ok = test_list_objects(client);
     if (!ok) {
         ret_code = 1;
     }
