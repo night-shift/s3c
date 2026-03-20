@@ -677,6 +677,7 @@ static const char* fn_stream_write_cb(const char* bytes, size_t num_bytes,
 
 s3cReply* s3c_get_object_stream(s3cClient* client,
                                 const char* bucket, const char* object_key,
+                                const s3cKVL* headers,
                                 s3cStreamCb cb, void* ctx)
 {
     s3cReply* err = NULL;
@@ -709,6 +710,7 @@ s3cReply* s3c_get_object_stream(s3cClient* client,
     OpArgs args = {
         .bucket = bucket,
         .object_key = object_key,
+        .headers = headers,
         .stream_wr = &stream_wr,
     };
 

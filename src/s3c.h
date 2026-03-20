@@ -87,11 +87,12 @@ s3cReply* s3c_get_object_to_file(s3cClient* client,
 // Return NULL on success, or an error string to abort the transfer.
 // The error string is copied internally and does not need to outlive the callback.
 typedef const char* (*s3cStreamCb)(const char* bytes, uint64_t num_bytes,
-                                    s3cKVL* headers, void* ctx);
+                                   s3cKVL* headers, void* ctx);
 
 s3cReply* s3c_get_object_stream(s3cClient* client,
-                                 const char* bucket, const char* object_key,
-                                 s3cStreamCb cb, void* ctx);
+                                const char* bucket, const char* object_key,
+                                const s3cKVL* headers,
+                                s3cStreamCb cb, void* ctx);
 
 s3cReply* s3c_put_object_from_file(s3cClient* client,
                                    const char* bucket, const char* object_key,

@@ -387,11 +387,11 @@ bool test_api_argument_validation(void)
     ok = expect_error_reply("get_object_to_file null file",
             s3c_get_object_to_file(client, "b", "k", NULL), "<file>") && ok;
     ok = expect_error_reply("get_object_cb null client",
-            s3c_get_object_stream(NULL, "b", "k", (s3cStreamCb)1, NULL), "<client>") && ok;
+            s3c_get_object_stream(NULL, "b", "k", NULL, (s3cStreamCb)1, NULL), "<client>") && ok;
     ok = expect_error_reply("get_object_cb null bucket",
-            s3c_get_object_stream(client, NULL, "k", (s3cStreamCb)1, NULL), "<bucket>") && ok;
+            s3c_get_object_stream(client, NULL, "k", NULL, (s3cStreamCb)1, NULL), "<bucket>") && ok;
     ok = expect_error_reply("get_object_cb null cb",
-            s3c_get_object_stream(client, "b", "k", NULL, NULL), "<cb>") && ok;
+            s3c_get_object_stream(client, "b", "k", NULL, NULL, NULL), "<cb>") && ok;
     ok = expect_error_reply("put_object null data",
             s3c_put_object(client, "b", "k", NULL, 1, NULL), "<data>") && ok;
     ok = expect_error_reply("put_object zero size",
@@ -726,7 +726,7 @@ bool test_big_object(s3cClient* client)
     s3c_reply_free(reply);
 
     reply = s3c_get_object_stream(client, TEST_BUCKET, object_key,
-                                   test_stream_cb_abort, NULL);
+                                   NULL, test_stream_cb_abort, NULL);
 
     if (reply->error == NULL) {
         log_err("error: expected error from aborted callback\n");
@@ -740,6 +740,42 @@ bool test_big_object(s3cClient* client)
     }
 
     log_info("ok\n");
+
+    log_info("get object stream with range header...");
+    s3c_reply_free(reply);
+
+    char range_data[100];
+    TestCbBuf range_buf = { .buf = range_data, .len = 0, .cap = 100 };
+    s3cKVL* range_headers = NULL;
+    s3c_kvl_ins(&range_headers, "Range", "bytes=0-99");
+
+    reply = s3c_get_object_stream(client, TEST_BUCKET, object_key,
+                                   range_headers, test_stream_cb, &range_buf);
+
+    s3c_kvl_free(range_headers);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->http_resp_code != 206) {
+        log_err("error: expected 206, got %d\n", (int)reply->http_resp_code);
+        goto cleanup_and_ret;
+    }
+
+    if (range_buf.len != 100) {
+        log_err("error: expected 100 bytes, got %" PRIu64 "\n",
+                (uint64_t)range_buf.len);
+        goto cleanup_and_ret;
+    }
+
+    if (memcmp(range_buf.buf, rt_data, 100) != 0) {
+        log_err("error: range data mismatch\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
 
     all_good = true;
 
@@ -1362,7 +1398,7 @@ bool run_basic_tests(s3cClient* client)
     };
 
     reply = s3c_get_object_stream(client, TEST_BUCKET, object_key,
-                               test_stream_cb, &cb_buf);
+                               NULL, test_stream_cb, &cb_buf);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
