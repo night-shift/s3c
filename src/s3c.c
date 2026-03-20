@@ -2915,10 +2915,16 @@ static void op_read_reply(OpContext* op)
     op_proc_reply(op, &recv_buf, http_resp_code);
 
 cleanup_and_ret:
-    ssl_shtudown_state = SSL_get_shutdown(op->ossl_ctx->ssl);
+    if (!op->ok) {
+        // force immediate close on error
+        SSL_set_shutdown(op->ossl_ctx->ssl,
+                         SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+    } else {
+        ssl_shtudown_state = SSL_get_shutdown(op->ossl_ctx->ssl);
 
-    if (ssl_shtudown_state != SSL_RECEIVED_SHUTDOWN) {
-        SSL_shutdown(op->ossl_ctx->ssl);
+        if (ssl_shtudown_state != SSL_RECEIVED_SHUTDOWN) {
+            SSL_shutdown(op->ossl_ctx->ssl);
+        }
     }
 
     str_destroy(&recv_buf);

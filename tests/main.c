@@ -722,6 +722,25 @@ bool test_big_object(s3cClient* client)
 
     log_info("ok\n");
 
+    log_info("get object stream abort (15MB)...");
+    s3c_reply_free(reply);
+
+    reply = s3c_get_object_stream(client, TEST_BUCKET, object_key,
+                                   test_stream_cb_abort, NULL);
+
+    if (reply->error == NULL) {
+        log_err("error: expected error from aborted callback\n");
+        goto cleanup_and_ret;
+    }
+
+    if (strstr(reply->error, "aborted by user") == NULL) {
+        log_err("error: expected 'aborted by user' in error, got: %s\n",
+                reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
     all_good = true;
 
 cleanup_and_ret:
@@ -845,6 +864,54 @@ bool test_multipart_api(s3cClient* client)
 
     log_info("ok\n");
 
+    s3c_reply_free(reply);
+    reply = NULL;
+    s3c_multipart_free(mp);
+    mp = NULL;
+
+    // test abort: init a new upload, send one part, then abort
+    log_info("multipart api: abort...");
+
+    const char* abort_key = "mp-test/abort.bin";
+
+    reply = s3c_multipart_init(client, TEST_BUCKET, abort_key, NULL, &mp);
+
+    if (reply->error != NULL) {
+        log_err("error: abort init: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(reply);
+
+    reply = s3c_multipart_upload_part(mp, 1, (const uint8_t*)data, part_size);
+
+    if (reply->error != NULL) {
+        log_err("error: abort upload part: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(reply);
+
+    reply = s3c_multipart_abort(mp);
+
+    if (reply->error != NULL) {
+        log_err("error: abort: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    // verify the object doesn't exist after abort
+    reply = s3c_head_object(client, TEST_BUCKET, abort_key);
+
+    if (reply->error == NULL) {
+        log_err("error: expected object to not exist after abort\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
     all_good = true;
 
 cleanup_and_ret:
@@ -862,15 +929,21 @@ cleanup_and_ret:
 
 bool test_bucket_config(s3cClient* client)
 {
+    const char* config_bucket = "s3c-tests-config";
     bool all_good = false;
     s3cReply* reply = NULL;
 
     log_info("bucket config: setup...");
 
-    if (!create_test_bucket(client)) {
-        log_err("error: failed to create test bucket\n");
+    reply = s3c_create_bucket(client, config_bucket, NULL);
+    if (reply->error != NULL && reply->http_resp_code != 409) {
+        log_err("error: failed to create config test bucket: %s\n", reply->error);
+        s3c_reply_free(reply);
+        reply = NULL;
         goto cleanup_and_ret;
     }
+    s3c_reply_free(reply);
+    reply = NULL;
 
     log_info("ok\n");
 
@@ -887,7 +960,7 @@ bool test_bucket_config(s3cClient* client)
         "</Rule>"
         "</LifecycleConfiguration>";
 
-    reply = s3c_set_bucket_config(client, TEST_BUCKET, "lifecycle", lifecycle_xml);
+    reply = s3c_set_bucket_config(client, config_bucket, "lifecycle", lifecycle_xml);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -901,7 +974,7 @@ bool test_bucket_config(s3cClient* client)
     // get the lifecycle config back
     log_info("bucket config: get lifecycle...");
 
-    reply = s3c_get_bucket_config(client, TEST_BUCKET, "lifecycle");
+    reply = s3c_get_bucket_config(client, config_bucket, "lifecycle");
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -930,7 +1003,7 @@ bool test_bucket_config(s3cClient* client)
     // send garbled xml — expect S3 to reject it
     log_info("bucket config: set garbled xml...");
 
-    reply = s3c_set_bucket_config(client, TEST_BUCKET, "lifecycle",
+    reply = s3c_set_bucket_config(client, config_bucket, "lifecycle",
                                    "<LifecycleConfiguration><not closed");
 
     if (reply->error == NULL) {
@@ -945,7 +1018,7 @@ bool test_bucket_config(s3cClient* client)
     // send valid xml with bogus fields — expect S3 to reject it
     log_info("bucket config: set bogus fields...");
 
-    reply = s3c_set_bucket_config(client, TEST_BUCKET, "lifecycle",
+    reply = s3c_set_bucket_config(client, config_bucket, "lifecycle",
                                    "<LifecycleConfiguration>"
                                    "<Rule>"
                                    "<BogusField>nonsense</BogusField>"
@@ -963,7 +1036,8 @@ bool test_bucket_config(s3cClient* client)
 
 cleanup_and_ret:
     s3c_reply_free(reply);
-    delete_test_bucket(client);
+    s3cReply* del_reply = s3c_delete_bucket(client, config_bucket);
+    s3c_reply_free(del_reply);
 
     return all_good;
 }
@@ -1312,24 +1386,6 @@ bool run_basic_tests(s3cClient* client)
     free(cb_buf.buf);
     log_info("ok resp code => %d\n", (int)reply->http_resp_code);
 
-    log_info("get object via callback abort...");
-    s3c_reply_free(reply);
-
-    reply = s3c_get_object_stream(client, TEST_BUCKET, object_key,
-                               test_stream_cb_abort, NULL);
-
-    if (reply->error == NULL) {
-        log_err("error: expected error from aborted callback\n");
-        goto cleanup_and_ret;
-    }
-
-    if (strstr(reply->error, "aborted by user") == NULL) {
-        log_err("error: expected 'aborted by user' in error, got: %s\n", reply->error);
-        goto cleanup_and_ret;
-    }
-
-    log_info("ok\n");
-
     log_info("head object...");
     s3c_reply_free(reply);
     reply = s3c_head_object(client, TEST_BUCKET, object_key);
@@ -1507,17 +1563,6 @@ bool run_basic_tests(s3cClient* client)
         log_err("error: expected error in reply but no error is set\n");
         goto cleanup_and_ret;
     }
-    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
-
-    log_info("delete bucket...");
-    s3c_reply_free(reply);
-    reply = s3c_delete_bucket(client, TEST_BUCKET);
-
-    if (reply->error != NULL) {
-        log_err("error: %s\n", reply->error);
-        goto cleanup_and_ret;
-    }
-
     log_info("ok resp code => %d\n", (int)reply->http_resp_code);
 
     all_good = true;
