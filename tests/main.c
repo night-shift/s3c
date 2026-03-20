@@ -427,6 +427,22 @@ bool test_api_argument_validation(void)
     ok = expect_error_reply("delete_bucket null bucket",
             s3c_delete_bucket(client, NULL), "<bucket>") && ok;
 
+    ok = expect_error_reply("get_bucket_config null client",
+            s3c_get_bucket_config(NULL, "b", "lifecycle"), "<client>") && ok;
+    ok = expect_error_reply("get_bucket_config null bucket",
+            s3c_get_bucket_config(client, NULL, "lifecycle"), "<bucket>") && ok;
+    ok = expect_error_reply("get_bucket_config null config_name",
+            s3c_get_bucket_config(client, "b", NULL), "<config_name>") && ok;
+
+    ok = expect_error_reply("set_bucket_config null client",
+            s3c_set_bucket_config(NULL, "b", "lifecycle", "<xml/>"), "<client>") && ok;
+    ok = expect_error_reply("set_bucket_config null bucket",
+            s3c_set_bucket_config(client, NULL, "lifecycle", "<xml/>"), "<bucket>") && ok;
+    ok = expect_error_reply("set_bucket_config null config_name",
+            s3c_set_bucket_config(client, "b", NULL, "<xml/>"), "<config_name>") && ok;
+    ok = expect_error_reply("set_bucket_config null body",
+            s3c_set_bucket_config(client, "b", "lifecycle", NULL), "<body>") && ok;
+
     ok = expect_error_reply("list_objects null client",
             s3c_list_objects(NULL, "b", NULL), "<client>") && ok;
     ok = expect_error_reply("list_objects null bucket",
@@ -840,6 +856,114 @@ cleanup_and_ret:
 
     delete_test_bucket(client);
     free(data);
+
+    return all_good;
+}
+
+bool test_bucket_config(s3cClient* client)
+{
+    bool all_good = false;
+    s3cReply* reply = NULL;
+
+    log_info("bucket config: setup...");
+
+    if (!create_test_bucket(client)) {
+        log_err("error: failed to create test bucket\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok\n");
+
+    // set a valid lifecycle config
+    log_info("bucket config: set lifecycle...");
+
+    const char* lifecycle_xml =
+        "<LifecycleConfiguration>"
+        "<Rule>"
+        "<ID>test-rule</ID>"
+        "<Status>Enabled</Status>"
+        "<Filter><Prefix>tmp/</Prefix></Filter>"
+        "<Expiration><Days>1</Days></Expiration>"
+        "</Rule>"
+        "</LifecycleConfiguration>";
+
+    reply = s3c_set_bucket_config(client, TEST_BUCKET, "lifecycle", lifecycle_xml);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    // get the lifecycle config back
+    log_info("bucket config: get lifecycle...");
+
+    reply = s3c_get_bucket_config(client, TEST_BUCKET, "lifecycle");
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->data == NULL || reply->data_size == 0) {
+        log_err("error: empty lifecycle config response\n");
+        goto cleanup_and_ret;
+    }
+
+    if (strstr((char*)reply->data, "test-rule") == NULL) {
+        log_err("error: lifecycle response missing rule ID 'test-rule'\n");
+        goto cleanup_and_ret;
+    }
+
+    if (strstr((char*)reply->data, "tmp/") == NULL) {
+        log_err("error: lifecycle response missing prefix 'tmp/'\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    // send garbled xml — expect S3 to reject it
+    log_info("bucket config: set garbled xml...");
+
+    reply = s3c_set_bucket_config(client, TEST_BUCKET, "lifecycle",
+                                   "<LifecycleConfiguration><not closed");
+
+    if (reply->error == NULL) {
+        log_err("error: expected S3 to reject garbled XML\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok rejected, resp code => %d\n", (int)reply->http_resp_code);
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    // send valid xml with bogus fields — expect S3 to reject it
+    log_info("bucket config: set bogus fields...");
+
+    reply = s3c_set_bucket_config(client, TEST_BUCKET, "lifecycle",
+                                   "<LifecycleConfiguration>"
+                                   "<Rule>"
+                                   "<BogusField>nonsense</BogusField>"
+                                   "</Rule>"
+                                   "</LifecycleConfiguration>");
+
+    if (reply->error == NULL) {
+        log_err("error: expected S3 to reject bogus fields\n");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok rejected, resp code => %d\n", (int)reply->http_resp_code);
+
+    all_good = true;
+
+cleanup_and_ret:
+    s3c_reply_free(reply);
+    delete_test_bucket(client);
 
     return all_good;
 }
@@ -1454,6 +1578,11 @@ int main(int argc, const char** argv)
     }
 
     ok = test_multipart_api(client);
+    if (!ok) {
+        ret_code = 1;
+    }
+
+    ok = test_bucket_config(client);
     if (!ok) {
         ret_code = 1;
     }

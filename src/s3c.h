@@ -128,6 +128,15 @@ s3cReply* s3c_create_bucket(s3cClient* client,
 
 s3cReply* s3c_delete_bucket(s3cClient* client, const char* bucket);
 
+s3cReply* s3c_get_bucket_config(s3cClient* client,
+                                const char* bucket,
+                                const char* config_name);
+
+s3cReply* s3c_set_bucket_config(s3cClient* client,
+                                const char* bucket,
+                                const char* config_name,
+                                const char* body);
+
 typedef struct {
     const char* prefix;
     const char* delimiter;

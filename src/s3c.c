@@ -557,6 +557,19 @@ StreamRead make_stream_rd_from_str_buf(StrBuf* buf)
     return stream;
 }
 
+static StreamWrite make_stream_wr_to_str_buf(StrBuf* buf, const RuntimeConfs* confs)
+{
+    StreamWrite stream = {
+        .fn_write = &fn_stream_write_str_buf,
+        .ctx = {
+            .opaque = buf,
+            .confs = confs,
+        }
+    };
+
+    return stream;
+}
+
 s3cReply* s3c_get_object(s3cClient* client,
                             const char* bucket, const char* object_key)
 {
@@ -571,14 +584,7 @@ s3cReply* s3c_get_object(s3cClient* client,
     }
 
     StrBuf res_buf = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
-
-    StreamWrite stream_wr = {
-        .fn_write = &fn_stream_write_str_buf,
-        .ctx = {
-            .opaque = &res_buf,
-            .confs = &client->confs,
-        }
-    };
+    StreamWrite stream_wr = make_stream_wr_to_str_buf(&res_buf, &client->confs);
 
     OpArgs args = {
         .bucket = bucket,
@@ -1487,6 +1493,96 @@ s3cReply* s3c_delete_bucket(s3cClient* client, const char* bucket)
     return run_s3_op(client, "DELETE", args);
 }
 
+s3cReply* s3c_get_bucket_config(s3cClient* client,
+                                    const char* bucket,
+                                    const char* config_name)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_str(bucket, "bucket")) != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_str(config_name, "config_name")) != NULL) {
+        return err;
+    }
+
+    s3cKVL query_args = {
+        .key = (char*)config_name,
+        .value = "",
+    };
+
+    StrBuf res_buf = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
+    StreamWrite stream_wr = make_stream_wr_to_str_buf(&res_buf, &client->confs);
+
+    OpArgs args = {
+        .bucket = bucket,
+        .query_args = &query_args,
+        .stream_wr = &stream_wr,
+    };
+
+    s3cReply* reply = run_s3_op(client, "GET", args);
+
+    if (reply->error == NULL) {
+        reply->data = (uint8_t*)res_buf.ptr;
+        reply->data_size = res_buf.len;
+    } else {
+        str_destroy(&res_buf);
+    }
+
+    return reply;
+}
+
+s3cReply* s3c_set_bucket_config(s3cClient* client,
+                                    const char* bucket,
+                                    const char* config_name,
+                                    const char* body)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_str(bucket, "bucket")) != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_str(config_name, "config_name")) != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_str(body, "body")) != NULL) {
+        return err;
+    }
+
+    s3cKVL query_args = {
+        .key = (char*)config_name,
+        .value = "",
+    };
+
+    StrBuf body_buf = str_init(strlen(body));
+    str_push_cstr(&body_buf, body);
+
+    StreamRead stream_rd = make_stream_rd_from_str_buf(&body_buf);
+
+    OpArgs args = {
+        .bucket = bucket,
+        .query_args = &query_args,
+        .stream_rd = &stream_rd,
+    };
+
+    s3cReply* reply = run_s3_op(client, "PUT", args);
+
+    str_destroy(&body_buf);
+
+    return reply;
+}
+
 static void parse_list_objects_xml(const char* xml, s3cListResult* out)
 {
     StrBuf tag_buf = str_init(256);
@@ -1575,14 +1671,7 @@ static s3cReply* list_objects_page(s3cClient* client,
     }
 
     StrBuf res_buf = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
-
-    StreamWrite stream_wr = {
-        .fn_write = &fn_stream_write_str_buf,
-        .ctx = {
-            .opaque = &res_buf,
-            .confs = &client->confs,
-        }
-    };
+    StreamWrite stream_wr = make_stream_wr_to_str_buf(&res_buf, &client->confs);
 
     OpArgs args = {
         .bucket = bucket,
