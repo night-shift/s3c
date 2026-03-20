@@ -83,9 +83,11 @@ s3cReply* s3c_get_object_to_file(s3cClient* client,
 
 // Stream callback for s3c_get_object_stream.
 // Called with each chunk of the response body.
+// headers contains the response headers (e.g. content-type, content-length).
 // Return NULL on success, or an error string to abort the transfer.
 // The error string is copied internally and does not need to outlive the callback.
-typedef const char* (*s3cStreamCb)(const char* bytes, uint64_t num_bytes, void* ctx);
+typedef const char* (*s3cStreamCb)(const char* bytes, uint64_t num_bytes,
+                                    s3cKVL* headers, void* ctx);
 
 s3cReply* s3c_get_object_stream(s3cClient* client,
                                  const char* bucket, const char* object_key,

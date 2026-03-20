@@ -17,11 +17,16 @@ typedef struct {
     char*  buf;
     size_t len;
     size_t cap;
+    bool   has_headers;
 } TestCbBuf;
 
-static const char* test_stream_cb(const char* bytes, uint64_t num_bytes, void* ctx)
+static const char* test_stream_cb(const char* bytes, uint64_t num_bytes,
+                                   s3cKVL* headers, void* ctx)
 {
     TestCbBuf* b = ctx;
+    if (headers != NULL && s3c_kvl_find(headers, "content-type") != NULL) {
+        b->has_headers = true;
+    }
     if (b->len + num_bytes > b->cap) {
         return "buffer overflow";
     }
@@ -30,10 +35,12 @@ static const char* test_stream_cb(const char* bytes, uint64_t num_bytes, void* c
     return NULL;
 }
 
-static const char* test_stream_cb_abort(const char* bytes, uint64_t num_bytes, void* ctx)
+static const char* test_stream_cb_abort(const char* bytes, uint64_t num_bytes,
+                                         s3cKVL* headers, void* ctx)
 {
     (void)bytes;
     (void)num_bytes;
+    (void)headers;
     (void)ctx;
     return "aborted by user";
 }
@@ -1168,6 +1175,12 @@ bool run_basic_tests(s3cClient* client)
     if (cb_buf.len != rt_data_size ||
         memcmp(cb_buf.buf, rt_data, rt_data_size) != 0) {
         log_err("error: callback data does not match original\n");
+        free(cb_buf.buf);
+        goto cleanup_and_ret;
+    }
+
+    if (!cb_buf.has_headers) {
+        log_err("error: callback did not receive response headers\n");
         free(cb_buf.buf);
         goto cleanup_and_ret;
     }

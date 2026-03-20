@@ -659,13 +659,14 @@ s3cReply* s3c_get_object_to_file(s3cClient* client,
 typedef struct {
     s3cStreamCb cb;
     void*       user_ctx;
+    s3cReply*   reply;
 } StreamCbAdapter;
 
 static const char* fn_stream_write_cb(const char* bytes, size_t num_bytes,
                                        StreamContext* c)
 {
     StreamCbAdapter* adapter = c->opaque;
-    return adapter->cb(bytes, (uint64_t)num_bytes, adapter->user_ctx);
+    return adapter->cb(bytes, (uint64_t)num_bytes, adapter->reply->headers, adapter->user_ctx);
 }
 
 s3cReply* s3c_get_object_stream(s3cClient* client,
@@ -686,7 +687,10 @@ s3cReply* s3c_get_object_stream(s3cClient* client,
         return s3c_reply_alloc("provided arguments missing value for <cb>");
     }
 
-    StreamCbAdapter adapter = { .cb = cb, .user_ctx = ctx };
+    s3cReply* reply = s3c_reply_alloc(NULL);
+    OpContext* op = calloc(1, sizeof(OpContext));
+
+    StreamCbAdapter adapter = { .cb = cb, .user_ctx = ctx, .reply = reply };
 
     StreamWrite stream_wr = {
         .fn_write = &fn_stream_write_cb,
@@ -702,7 +706,15 @@ s3cReply* s3c_get_object_stream(s3cClient* client,
         .stream_wr = &stream_wr,
     };
 
-    return run_s3_op(client, "GET", args);
+    op_context_init(op, args, client, reply);
+
+    if (op->ok) {
+        op_run_request(op, "GET");
+    }
+
+    op_context_free(op);
+
+    return reply;
 }
 
 s3cReply* s3c_put_object(s3cClient* client,
