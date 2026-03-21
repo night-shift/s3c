@@ -3331,6 +3331,7 @@ static void op_read_reply(OpContext* op, const char* html_verb)
 
             if (body_mode == BODY_UNTIL_CLOSE || body_mode == BODY_NONE) {
                 body_done = true;
+                break;
             }
             op_set_error(op, "http reply ended before body was fully received");
             goto cleanup_and_ret;
@@ -3408,6 +3409,7 @@ static void op_read_reply(OpContext* op, const char* html_verb)
                     }
                 }
             } else {
+                body_mode = BODY_UNTIL_CLOSE;
             }
 
             op->can_reuse_conn = !conn_close && body_mode != BODY_UNTIL_CLOSE
