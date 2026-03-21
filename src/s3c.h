@@ -8,8 +8,9 @@ extern "C" {
 
 #define S3C_CONF_NET_IO_TIMEOUT_SEC         0  // default 15 seconds
 #define S3C_CONF_MAX_REPLY_PREALLOC_SIZE_MB 1  // default 128 mb
+#define S3C_CONF_CLIENT_IDLE_SEC_MAX        2  // default 300 seconds
 
-uint64_t s3c_set_global_config(uint64_t conf_num, int64_t value);
+uint64_t s3c_set_global_config(uint64_t conf_num, uint64_t value);
 
 typedef struct {
     char* access_key_id;
@@ -157,10 +158,10 @@ typedef struct s3cMultipart s3cMultipart;
 s3cReply* s3c_multipart_init(s3cClient* client,
                              const char* bucket, const char* object_key,
                              const s3cKVL* headers,
+                             const s3cMultipartOpts* opts,
                              s3cMultipart** out);
 
 s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
-                                    uint64_t part_number,
                                     const uint8_t* data, uint64_t data_size);
 
 s3cReply* s3c_multipart_complete(s3cMultipart* mp);
@@ -193,7 +194,6 @@ void s3c_list_entry_free(s3cListEntry*);
 #ifdef __cplusplus
 }
 #endif
-
 
 
 

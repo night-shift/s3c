@@ -9,6 +9,8 @@
 #include <string.h>
 #include <stdarg.h>
 #include <inttypes.h>
+#include <time.h>
+#include <unistd.h>
 
 const char* TEST_BUCKET = "s3c-tests";
 const char* LOCAL_OBJ_FILE = "tests/obj_file";
@@ -46,15 +48,60 @@ static const char* test_stream_cb_abort(const char* bytes, uint64_t num_bytes,
 }
 
 
+static struct timespec log_timer;
+static bool log_timer_active = false;
+
+static void log_flush_timer(void)
+{
+    if (!log_timer_active) return;
+    log_timer_active = false;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    double ms = (now.tv_sec - log_timer.tv_sec) * 1000.0
+              + (now.tv_nsec - log_timer.tv_nsec) / 1e6;
+
+    if (ms < 1000.0) {
+        printf(" [%.0fms]", ms);
+    } else {
+        printf(" [%.1fs]", ms / 1000.0);
+    }
+}
+
 void log_info(const char* fmt_str, ...)
 {
-    va_list args;
-    va_start(args, fmt_str);
+    size_t len = strlen(fmt_str);
+    bool ends_with_newline = len > 0 && fmt_str[len - 1] == '\n';
 
-    vprintf(fmt_str, args);
+    if (ends_with_newline) {
+        // print everything except the trailing \n
+        char tmp[2048];
+        va_list args;
+        va_start(args, fmt_str);
+        vsnprintf(tmp, sizeof(tmp), fmt_str, args);
+        va_end(args);
+
+        size_t tlen = strlen(tmp);
+        if (tlen > 0 && tmp[tlen - 1] == '\n') {
+            tmp[tlen - 1] = '\0';
+        }
+        printf("%s", tmp);
+        log_flush_timer();
+        printf("\n");
+    } else {
+        va_list args;
+        va_start(args, fmt_str);
+        vprintf(fmt_str, args);
+        va_end(args);
+    }
+
+    // start timer for lines ending with "..."
+    if (len >= 3 && fmt_str[len - 1] == '.' && fmt_str[len - 2] == '.' && fmt_str[len - 3] == '.') {
+        clock_gettime(CLOCK_MONOTONIC, &log_timer);
+        log_timer_active = true;
+    }
+
     fflush(stdout);
-
-    va_end(args);
 }
 
 void log_err(const char* fmt_str, ...)
@@ -204,11 +251,6 @@ bool test_config_api(void)
 
     if (!s3c_set_global_config(S3C_CONF_MAX_REPLY_PREALLOC_SIZE_MB, 4)) {
         log_err("error: failed to set max reply prealloc config\n");
-        ok = false;
-    }
-
-    if (s3c_set_global_config(S3C_CONF_NET_IO_TIMEOUT_SEC, -1)) {
-        log_err("error: expected negative net timeout config set to fail\n");
         ok = false;
     }
 
@@ -463,17 +505,15 @@ bool test_api_argument_validation(void)
 
     s3cMultipart* mp_dummy = NULL;
     ok = expect_error_reply("multipart_init null client",
-            s3c_multipart_init(NULL, "b", "k", NULL, &mp_dummy), "<client>") && ok;
+            s3c_multipart_init(NULL, "b", "k", NULL, NULL, &mp_dummy), "<client>") && ok;
     ok = expect_error_reply("multipart_init null bucket",
-            s3c_multipart_init(client, NULL, "k", NULL, &mp_dummy), "<bucket>") && ok;
+            s3c_multipart_init(client, NULL, "k", NULL, NULL, &mp_dummy), "<bucket>") && ok;
 
     uint8_t mp_byte = 1;
     ok = expect_error_reply("multipart_upload_part null mp",
-            s3c_multipart_upload_part(NULL, 1, &mp_byte, 1), "<multipart>") && ok;
+            s3c_multipart_upload_part(NULL, &mp_byte, 1), "<multipart>") && ok;
     ok = expect_error_reply("multipart_upload_part null data",
-            s3c_multipart_upload_part((s3cMultipart*)&mp_byte, 1, NULL, 1), "<data>") && ok;
-    ok = expect_error_reply("multipart_upload_part bad part_number",
-            s3c_multipart_upload_part((s3cMultipart*)&mp_byte, 0, &mp_byte, 1), "<part_number>") && ok;
+            s3c_multipart_upload_part((s3cMultipart*)&mp_byte, NULL, 1), "<data>") && ok;
 
     ok = expect_error_reply("multipart_complete null mp",
             s3c_multipart_complete(NULL), "<multipart>") && ok;
@@ -802,8 +842,9 @@ bool test_multipart_api(s3cClient* client)
     const char* object_key = "mp-test/file.bin";
 
     // S3 minimum part size is 5MB (except last part)
-    size_t part_size = 1024 * 1024 * 5;
-    size_t total_size = part_size * 2 + 1024; // 2 full parts + small last part
+    size_t min_part_size = 1024 * 1024 * 5;
+    size_t input_chunk_size = 1024 * 1024; // intentionally < 5MB to test accumulation
+    size_t total_size = min_part_size * 2 + 1024; // 2 full parts + small last part
 
     char* data = calloc(total_size, 1);
     for (size_t i = 0; i < total_size; i++) {
@@ -821,7 +862,7 @@ bool test_multipart_api(s3cClient* client)
 
     log_info("multipart api: init...");
 
-    reply = s3c_multipart_init(client, TEST_BUCKET, object_key, NULL, &mp);
+    reply = s3c_multipart_init(client, TEST_BUCKET, object_key, NULL, NULL, &mp);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -841,20 +882,18 @@ bool test_multipart_api(s3cClient* client)
     log_info("multipart api: upload parts...");
 
     size_t offset = 0;
-    uint64_t part_num = 1;
+    uint64_t call_num = 1;
 
     while (offset < total_size) {
         size_t chunk = total_size - offset;
-        if (chunk > part_size) {
-            chunk = part_size;
+        if (chunk > input_chunk_size) {
+            chunk = input_chunk_size;
         }
 
-        reply = s3c_multipart_upload_part(
-            mp, part_num, (const uint8_t*)data + offset, chunk
-        );
+        reply = s3c_multipart_upload_part(mp, (const uint8_t*)data + offset, chunk);
 
         if (reply->error != NULL) {
-            log_err("error: part %" PRIu64 ": %s\n", part_num, reply->error);
+            log_err("error: upload call %" PRIu64 ": %s\n", call_num, reply->error);
             goto cleanup_and_ret;
         }
 
@@ -862,10 +901,10 @@ bool test_multipart_api(s3cClient* client)
         reply = NULL;
 
         offset += chunk;
-        part_num++;
+        call_num++;
     }
 
-    log_info("ok (%d parts)\n", (int)(part_num - 1));
+    log_info("ok (%d calls)\n", (int)(call_num - 1));
 
     log_info("multipart api: complete...");
 
@@ -910,7 +949,7 @@ bool test_multipart_api(s3cClient* client)
 
     const char* abort_key = "mp-test/abort.bin";
 
-    reply = s3c_multipart_init(client, TEST_BUCKET, abort_key, NULL, &mp);
+    reply = s3c_multipart_init(client, TEST_BUCKET, abort_key, NULL, NULL, &mp);
 
     if (reply->error != NULL) {
         log_err("error: abort init: %s\n", reply->error);
@@ -919,7 +958,7 @@ bool test_multipart_api(s3cClient* client)
 
     s3c_reply_free(reply);
 
-    reply = s3c_multipart_upload_part(mp, 1, (const uint8_t*)data, part_size);
+    reply = s3c_multipart_upload_part(mp, (const uint8_t*)data, min_part_size);
 
     if (reply->error != NULL) {
         log_err("error: abort upload part: %s\n", reply->error);
@@ -1613,18 +1652,56 @@ cleanup_and_ret:
     return all_good;
 }
 
+bool test_idle(s3cClient* client, int sleep_sec)
+{
+    log_info("idle test: request 1...");
+
+    s3cReply* r = s3c_list_objects(client, TEST_BUCKET, NULL);
+    if (r->error != NULL) {
+        log_err("error: %s\n", r->error);
+        s3c_reply_free(r);
+        return false;
+    }
+    log_info("ok resp code => %d\n", (int)r->http_resp_code);
+    s3c_reply_free(r);
+
+    log_info("idle test: sleeping %ds...\n", sleep_sec);
+    sleep(sleep_sec);
+
+    log_info("idle test: request 2...");
+    r = s3c_list_objects(client, TEST_BUCKET, NULL);
+    if (r->error != NULL) {
+        log_err("error: %s\n", r->error);
+        s3c_reply_free(r);
+        return false;
+    }
+    log_info("ok resp code => %d\n", (int)r->http_resp_code);
+    s3c_reply_free(r);
+
+    return true;
+}
+
 int main(int argc, const char** argv)
 {
     const char* keys_file = "tests/s3c_keys";
     int ret_code = 0;
+    bool run_idle_test = false;
+    int idle_sleep_sec = 10;
 
     s3cKeys keys = {0};
     s3cClient* client = NULL;
     s3cReply* client_err = NULL;
 
-    if (argc > 1) {
-        keys_file = argv[1];
-        log_info("using arg supplied keys file '%s'\n", keys_file);
+    for (int i = 1; i < argc; i++) {
+        if (strncmp(argv[i], "--test-idle", 11) == 0) {
+            run_idle_test = true;
+            if (argv[i][11] == '=' && argv[i][12] != '\0') {
+                idle_sleep_sec = atoi(&argv[i][12]);
+            }
+        } else {
+            keys_file = argv[i];
+            log_info("using arg supplied keys file '%s'\n", keys_file);
+        }
     }
 
     bool ok = run_local_tests();
@@ -1645,6 +1722,12 @@ int main(int argc, const char** argv)
         log_info("failed to run tests: %s\n",
                  client_err != NULL ? client_err->error : "failed to initialize s3 client");
         ret_code = 1;
+        goto cleanup_and_ret;
+    }
+
+    if (run_idle_test) {
+        ok = test_idle(client, idle_sleep_sec);
+        if (!ok) ret_code = 1;
         goto cleanup_and_ret;
     }
 

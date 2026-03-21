@@ -11,6 +11,7 @@
 
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 
 #include <openssl/opensslv.h>
 
@@ -36,21 +37,25 @@ static const char* S3_HTTP_VERSION      = "HTTP/1.1";
 
 #define S3C_DATE_TIME_STAMP_SIZE sizeof("yyyymmddThhmmssZ")
 #define S3C_DATE_STAMP_SIZE      sizeof("yyyymmdd")
+#define S3C_MULTIPART_MIN_PART_SIZE (5U * 1024U * 1024U)
 
 #define S3C_DEF_NET_IO_TIMEOUT_SEC          15U
 #define S3C_DEF_MAX_REPLY_PREALLOC_SIZE_MB 128U
 #define S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB  10U
+#define S3C_DEF_CLIENT_IDLE_SEC_MAX         300
 
 typedef struct {
-    uint32_t net_io_timeout_sec;
-    uint32_t max_reply_prealloc_size_mb;
-    uint32_t str_buf_max_cap_reserve_mb;
+    uint64_t net_io_timeout_sec;
+    uint64_t max_reply_prealloc_size_mb;
+    uint64_t str_buf_max_cap_reserve_mb;
+    uint64_t client_idle_sec_max;
 } RuntimeConfs;
 
 static RuntimeConfs S3C_DEFAULT_CONFS = {
     .net_io_timeout_sec = S3C_DEF_NET_IO_TIMEOUT_SEC,
     .max_reply_prealloc_size_mb = S3C_DEF_MAX_REPLY_PREALLOC_SIZE_MB,
     .str_buf_max_cap_reserve_mb = S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB,
+    .client_idle_sec_max = S3C_DEF_CLIENT_IDLE_SEC_MAX
 };
 
 typedef struct {
@@ -61,12 +66,15 @@ struct s3cClient {
     s3cKeys keys;
     RuntimeConfs confs;
     SSL_CTX* ssl_ctx;
+    OsslContext* conn;
+    time_t last_used;
 };
 
 static const char* ossl_ctx_init(SSL_CTX** out_ctx);
 static const char* ossl_init(OsslContext*, SSL_CTX* ssl_ctx);
 static void        ossl_free(OsslContext*);
-static const char* ossl_connect(OsslContext*, const char* host, uint32_t net_timeout_sec);
+static void        ossl_disconnect(OsslContext*);
+static const char* ossl_connect(OsslContext*, const char* host, uint64_t net_timeout_sec);
 
 
 typedef struct {
@@ -83,6 +91,7 @@ typedef struct {
 
 typedef struct {
     const char* (*fn_read)(size_t, StreamContext*, const char**, size_t*);
+    const char* (*fn_reset)(StreamContext*);
     StreamContext ctx;
 } StreamRead;
 
@@ -98,9 +107,10 @@ typedef struct {
 
 typedef struct {
     bool           ok;
-    const s3cClient* client;
+    bool           io_failed;
+    bool           can_reuse_conn;
+    s3cClient*     client;
     s3cReply*      reply;
-    OsslContext*   ossl_ctx;
     OpArgs         args;
 } OpContext;
 
@@ -108,7 +118,7 @@ typedef struct {
     char*  ptr;
     size_t len;
     size_t cap;
-    uint32_t max_cap_reserve_mb;
+    uint64_t max_cap_reserve_mb;
 } StrBuf;
 
 typedef struct {
@@ -121,17 +131,17 @@ typedef struct {
     char date      [S3C_DATE_STAMP_SIZE];
 } DateStamps;
 
-static void op_context_init(OpContext*, OpArgs args, const s3cClient*,  s3cReply*);
+static void op_context_init(OpContext*, OpArgs args, s3cClient*,  s3cReply*);
 static void op_context_free(OpContext*);
 static void op_run_request(OpContext* op, const char* html_verb);
-static void op_send_request(OpContext*, StrBuf* http_request);
-static void op_read_reply(OpContext*);
+static void op_send_request(OpContext*, const char* html_verb, StrBuf* http_request);
+static void op_read_reply(OpContext*, const char* html_verb);
 static void op_proc_reply(OpContext*, StrBuf* reply, unsigned http_resp_code);
 static void op_set_error(OpContext* op, const char* error);
 static void op_set_error_fmt(OpContext* op, const char* fmt, ...);
 
 static StrBuf str_init(size_t cap);
-static StrBuf str_init_conf(size_t cap, uint32_t max_cap_reserve_mb);
+static StrBuf str_init_conf(size_t cap, uint64_t max_cap_reserve_mb);
 static size_t str_set_cap(StrBuf*, size_t cap);
 static void   str_destroy(StrBuf*);
 static size_t str_push(StrBuf*, const char* a, size_t a_len);
@@ -147,12 +157,8 @@ static void s3c_kvl_upsert(s3cKVL** head, const char* name, const char* value);
 static void set_runtime_confs(RuntimeConfs* out, const s3cClientOpts* opts);
 static char* normalize_endpoint_host(const char* endpoint);
 
-uint64_t s3c_set_global_config(uint64_t opt, int64_t value)
+uint64_t s3c_set_global_config(uint64_t opt, uint64_t value)
 {
-    if (value < 0) {
-        return 0;
-    }
-
     switch (opt) {
         case S3C_CONF_NET_IO_TIMEOUT_SEC:
             S3C_DEFAULT_CONFS.net_io_timeout_sec = value;
@@ -160,6 +166,10 @@ uint64_t s3c_set_global_config(uint64_t opt, int64_t value)
 
         case S3C_CONF_MAX_REPLY_PREALLOC_SIZE_MB:
             S3C_DEFAULT_CONFS.max_reply_prealloc_size_mb = value;
+            return 1;
+
+        case S3C_CONF_CLIENT_IDLE_SEC_MAX:
+            S3C_DEFAULT_CONFS.client_idle_sec_max = value;
             return 1;
     }
 
@@ -214,12 +224,14 @@ void s3c_reply_free(s3cReply* reply)
     free(reply->data);
 
     switch (reply->result_kind) {
-    case S3C_RESULT_LIST:
-        s3c_list_entry_free(reply->result.list.entries);
-        free(reply->result.list.continuation_token);
-        break;
-    default:
-        break;
+
+        case S3C_RESULT_LIST:
+            s3c_list_entry_free(reply->result.list.entries);
+            free(reply->result.list.continuation_token);
+            break;
+
+        default:
+            break;
     }
 
     free(reply);
@@ -367,14 +379,26 @@ s3cClient* s3c_client_new(const s3cKeys* keys,
     return client;
 }
 
+static void secure_free(char* ptr)
+{
+    if (ptr == NULL) {
+        return;
+    }
+
+    size_t len = strlen(ptr);
+    OPENSSL_cleanse(ptr, len);
+    free(ptr);
+}
+
 void s3c_client_free(s3cClient* client)
 {
     if (client == NULL) {
         return;
     }
 
-    free(client->keys.access_key_id);
-    free(client->keys.access_key_secret);
+    ossl_free(client->conn);
+    secure_free(client->keys.access_key_id);
+    secure_free(client->keys.access_key_secret);
     free(client->keys.region);
     free(client->keys.endpoint);
 
@@ -426,7 +450,7 @@ static s3cReply* check_arg_bucket_key(const char* bucket, const char* object_key
     return NULL;
 }
 
-static s3cReply* run_s3_op(const s3cClient* client, const char* html_verb, OpArgs args)
+static s3cReply* run_s3_op(s3cClient* client, const char* html_verb, OpArgs args)
 {
     OpContext* op = calloc(1, sizeof(OpContext));
     s3cReply* reply = s3c_reply_alloc(NULL);
@@ -543,18 +567,48 @@ static const char* fn_stream_read_file(size_t read_num_bytes, StreamContext* c,
     return NULL;
 }
 
-StreamRead make_stream_rd_from_str_buf(StrBuf* buf)
+static const char* fn_stream_reset_mem(StreamContext* c)
+{
+    c->cursor = 0;
+    return NULL;
+}
+
+static const char* fn_stream_reset_file(StreamContext* c)
+{
+    BufferedFile* bf = c->opaque;
+    c->cursor = 0;
+    if (fseek(bf->fp, 0, SEEK_SET) != 0) {
+        return "failed to seek file to start";
+    }
+    return NULL;
+}
+
+static StreamRead make_stream_rd_mem(StreamContext ctx)
 {
     StreamRead stream = {
         .fn_read = &fn_stream_read_mem,
-        .ctx = {
-            .total_size = buf->len,
-            .cursor = 0,
-            .opaque = buf->ptr,
-        }
+        .fn_reset = &fn_stream_reset_mem,
+        .ctx = ctx,
     };
-
     return stream;
+}
+
+static StreamRead make_stream_rd_file(StreamContext ctx)
+{
+    StreamRead stream = {
+        .fn_read = &fn_stream_read_file,
+        .fn_reset = &fn_stream_reset_file,
+        .ctx = ctx,
+    };
+    return stream;
+}
+
+StreamRead make_stream_rd_from_str_buf(StrBuf* buf)
+{
+    return make_stream_rd_mem((StreamContext){
+        .total_size = buf->len,
+        .opaque = buf->ptr,
+    });
 }
 
 static StreamWrite make_stream_wr_to_str_buf(StrBuf* buf, const RuntimeConfs* confs)
@@ -726,9 +780,9 @@ s3cReply* s3c_get_object_stream(s3cClient* client,
 }
 
 s3cReply* s3c_put_object(s3cClient* client,
-                            const char* bucket, const char* object_key,
-                            const uint8_t* data, uint64_t data_size,
-                            const s3cKVL* headers)
+                         const char* bucket, const char* object_key,
+                         const uint8_t* data, uint64_t data_size,
+                         const s3cKVL* headers)
 {
     s3cReply* err = check_arg_bucket_key(bucket, object_key);
 
@@ -748,15 +802,11 @@ s3cReply* s3c_put_object(s3cClient* client,
         return s3c_reply_alloc("provided argument value for <data_size> is 0");
     }
 
-    StreamRead stream_rd = {
-        .fn_read = &fn_stream_read_mem,
-        .ctx = {
-            .total_size = data_size,
-            .cursor = 0,
-            .opaque = (void*)data,
-            .confs = &client->confs,
-        }
-    };
+    StreamRead stream_rd = make_stream_rd_mem((StreamContext){
+        .total_size = data_size,
+        .opaque = (void*)data,
+        .confs = &client->confs,
+    });
 
     OpArgs args = {
         .bucket = bucket,
@@ -801,7 +851,7 @@ cleanup_and_ret:
     str_destroy(&tag_str);
 }
 
-static s3cReply* s3c_multipart_upload_abort(const s3cClient* client,
+static s3cReply* s3c_multipart_upload_abort(s3cClient* client,
                                             const char* bucket, const char* obj_key,
                                             const char* upload_id)
 {
@@ -819,7 +869,7 @@ static s3cReply* s3c_multipart_upload_abort(const s3cClient* client,
     return run_s3_op(client, "DELETE", args);
 }
 
-static s3cReply* s3c_multipart_upload_init(const s3cClient* client,
+static s3cReply* s3c_multipart_upload_init(s3cClient* client,
                                            const char* bucket, const char* object_key,
                                            const s3cKVL* headers,
                                            StrBuf* out_upload_id)
@@ -860,7 +910,7 @@ static s3cReply* s3c_multipart_upload_init(const s3cClient* client,
     return reply;
 }
 
-static s3cReply* s3c_multipart_upload_finish(const s3cClient* client,
+static s3cReply* s3c_multipart_upload_finish(s3cClient* client,
                                              const char* bucket, const char* object_key,
                                              const char* upload_id, s3cKVL* etags)
 {
@@ -925,137 +975,20 @@ cleanup_and_ret:
     return reply;
 }
 
-static s3cReply* s3c_multipart_upload_run(const s3cClient* client,
-                                          const char* bucket, const char* obj_key,
-                                          FILE* fp, const char* upload_id,
-                                          const s3cMultipartOpts* opts)
-{
-    uint8_t* chunk_buf = malloc(opts->part_size);
-    s3cReply* reply = NULL;
-    s3cKVL* etags_head = NULL;
-    s3cKVL* etags_tail = NULL;
-    StrBuf iota_buf = str_init(0);
-
-    fseek(fp, 0, SEEK_END);
-    size_t file_size = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    size_t left_to_send = file_size;
-
-    s3cKVL q_arg_upload_id = {
-        .key = "uploadId",
-        .value = (char*)upload_id,
-    };
-
-    s3cKVL q_arg_part_num = {
-        .key = "partNumber",
-        .value = NULL,
-        .next = &q_arg_upload_id,
-    };
-
-    StreamRead stream_rd = {
-        .fn_read = &fn_stream_read_mem,
-        .ctx = {
-            .opaque = chunk_buf,
-            .confs = &client->confs,
-        }
-    };
-
-    OpArgs op_args = {
-        .bucket = bucket,
-        .object_key = obj_key,
-        .query_args = &q_arg_part_num,
-        .stream_rd = &stream_rd,
-    };
-
-    int part_number = 0;
-
-    while (left_to_send > 0) {
-        size_t send_now = left_to_send > opts->part_size
-            ? opts->part_size
-            : left_to_send;
-
-        size_t bytes_read = fread(chunk_buf, 1, send_now, fp);
-
-        if (bytes_read < send_now) {
-            reply = s3c_reply_alloc("failed to read file");
-            goto cleanup_and_ret;
-        }
-
-        iota_buf.len = 0;
-        str_push_int(&iota_buf, part_number + 1);
-        q_arg_part_num.value = iota_buf.ptr;
-
-        stream_rd.ctx.total_size = send_now;
-
-        unsigned num_retries = 0;
-
-        while (1) {
-            reply = run_s3_op(client, "PUT", op_args);
-
-            if (reply->error == NULL) {
-                break;
-            }
-
-            bool server_err = reply->http_resp_code == 500 ||
-                              reply->http_resp_code == 502 ||
-                              reply->http_resp_code == 503 ||
-                              reply->http_resp_code == 504;
-
-            if (!server_err || num_retries >= opts->max_send_retries) {
-                goto cleanup_and_ret;
-            }
-
-            s3c_reply_free(reply);
-            num_retries += 1;
-        }
-
-        s3cKVL* etag = s3c_kvl_find(reply->headers, "ETag");
-
-        if (etag == NULL) {
-            s3c_reply_free(reply);
-            reply = s3c_reply_alloc("S3 reply missing header ETag");
-            goto cleanup_and_ret;
-        }
-
-        s3cKVL* etag_copy = malloc(sizeof(s3cKVL));
-        *etag_copy = *etag;
-        etag->key = NULL;
-        etag->value = NULL;
-        etag_copy->next = NULL;
-
-        if (etags_head == NULL) {
-            etags_head = etag_copy;
-        } else {
-            etags_tail->next = etag_copy;
-        }
-
-        etags_tail = etag_copy;
-        left_to_send -= send_now;
-        part_number += 1;
-        s3c_reply_free(reply);
-    }
-
-    reply = s3c_multipart_upload_finish(
-        client, bucket, obj_key, upload_id, etags_head
-    );
-
-cleanup_and_ret:
-    free(chunk_buf);
-    s3c_kvl_free(etags_head);
-    str_destroy(&iota_buf);
-
-    return reply;
-}
 
 struct s3cMultipart {
     s3cClient*  client;
     char*       bucket;
     char*       object_key;
     char*       upload_id;
+    StrBuf      part_buf;
     s3cKVL*     etags;
     s3cKVL*     etags_tail;
+    size_t      next_part_number;
+    size_t      max_retries;
+    size_t      part_size;
 };
+
 
 void s3c_multipart_free(s3cMultipart* mp)
 {
@@ -1066,14 +999,16 @@ void s3c_multipart_free(s3cMultipart* mp)
     free(mp->bucket);
     free(mp->object_key);
     free(mp->upload_id);
+    str_destroy(&mp->part_buf);
     s3c_kvl_free(mp->etags);
     free(mp);
 }
 
 s3cReply* s3c_multipart_init(s3cClient* client,
-                                 const char* bucket, const char* object_key,
-                                 const s3cKVL* headers,
-                                 s3cMultipart** out)
+                             const char* bucket, const char* object_key,
+                             const s3cKVL* headers,
+                             const s3cMultipartOpts* opts,
+                             s3cMultipart** out)
 {
     *out = NULL;
     s3cReply* err = NULL;
@@ -1102,33 +1037,31 @@ s3cReply* s3c_multipart_init(s3cClient* client,
     mp->bucket = str_dup(bucket);
     mp->object_key = str_dup(object_key);
     mp->upload_id = str_extract(&upload_id);
+    mp->next_part_number = 1;
+
+    mp->max_retries = opts != NULL
+        ? opts->max_send_retries
+        : 3;
+
+    mp->part_size = opts != NULL && opts->part_size >= S3C_MULTIPART_MIN_PART_SIZE
+        ? opts->part_size
+        : S3C_MULTIPART_MIN_PART_SIZE;
+
+    mp->part_buf = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
 
     *out = mp;
     return reply;
 }
 
-s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
-                                        uint64_t part_number,
-                                        const uint8_t* data, uint64_t data_size)
+static s3cReply* s3c_multipart_upload_perform(s3cMultipart* mp,
+                                              const uint8_t* data, uint64_t data_size)
 {
-    if (mp == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <multipart>");
-    }
-
-    if (data == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <data>");
-    }
-
-    if (data_size < 1) {
-        return s3c_reply_alloc("provided arguments missing value for <data_size>");
-    }
-
-    if (part_number < 1 || part_number > 10000) {
-        return s3c_reply_alloc("<part_number> must be between 1 and 10000");
+    if (mp->next_part_number < 1 || mp->next_part_number > 10000) {
+        return s3c_reply_alloc("multipart supports at most 10000 parts");
     }
 
     char part_num_str[21];
-    snprintf(part_num_str, sizeof(part_num_str), "%" PRIu64, part_number);
+    snprintf(part_num_str, sizeof(part_num_str), "%" PRIu64, mp->next_part_number);
 
     s3cKVL q_upload_id = {
         .key = "uploadId",
@@ -1141,14 +1074,11 @@ s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
         .next = &q_upload_id,
     };
 
-    StreamRead stream_rd = {
-        .fn_read = &fn_stream_read_mem,
-        .ctx = {
-            .opaque = (void*)data,
-            .total_size = data_size,
-            .confs = &mp->client->confs,
-        }
-    };
+    StreamRead stream_rd = make_stream_rd_mem((StreamContext){
+        .opaque = (void*)data,
+        .total_size = data_size,
+        .confs = &mp->client->confs,
+    });
 
     OpArgs args = {
         .bucket = mp->bucket,
@@ -1157,10 +1087,28 @@ s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
         .stream_rd = &stream_rd,
     };
 
-    s3cReply* reply = run_s3_op(mp->client, "PUT", args);
+    s3cReply* reply = NULL;
+    unsigned num_retries = 0;
 
-    if (reply->error != NULL) {
-        return reply;
+    while (1) {
+        stream_rd.ctx.cursor = 0;
+        reply = run_s3_op(mp->client, "PUT", args);
+
+        if (reply->error == NULL) {
+            break;
+        }
+
+        bool server_err = reply->http_resp_code == 500 ||
+                          reply->http_resp_code == 502 ||
+                          reply->http_resp_code == 503 ||
+                          reply->http_resp_code == 504;
+
+        if (!server_err || num_retries >= mp->max_retries) {
+            return reply;
+        }
+
+        s3c_reply_free(reply);
+        num_retries += 1;
     }
 
     // collect etag for complete call
@@ -1183,14 +1131,74 @@ s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
         mp->etags_tail->next = etag_copy;
     }
     mp->etags_tail = etag_copy;
+    mp->next_part_number += 1;
 
     return reply;
+}
+
+s3cReply* s3c_multipart_upload_part(s3cMultipart* mp,
+                                    const uint8_t* data, uint64_t data_size)
+{
+    if (mp == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <multipart>");
+    }
+
+    if (data == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <data>");
+    }
+
+    if (data_size < 1) {
+        return s3c_reply_alloc("provided arguments missing value for <data_size>");
+    }
+
+    if (data_size > SIZE_MAX) {
+        return s3c_reply_alloc("multipart part input too large");
+    }
+
+    if (str_push(&mp->part_buf, (const char*)data, data_size) < data_size) {
+        return s3c_reply_alloc("multipart part buffer allocation failed");
+    }
+
+    s3cReply* last_reply = s3c_reply_alloc(NULL);
+
+    while (mp->part_buf.len >= mp->part_size) {
+        s3cReply* reply = s3c_multipart_upload_perform(
+            mp, (const uint8_t*)mp->part_buf.ptr, mp->part_size
+        );
+
+        if (reply->error != NULL) {
+            s3c_reply_free(last_reply);
+            return reply;
+        }
+
+        s3c_reply_free(last_reply);
+        last_reply = reply;
+
+        size_t left = mp->part_buf.len - mp->part_size;
+        memmove(mp->part_buf.ptr, mp->part_buf.ptr + mp->part_size, left);
+        mp->part_buf.len = left;
+    }
+
+    return last_reply;
 }
 
 s3cReply* s3c_multipart_complete(s3cMultipart* mp)
 {
     if (mp == NULL) {
         return s3c_reply_alloc("provided arguments missing value for <multipart>");
+    }
+
+    if (mp->part_buf.len > 0) {
+        s3cReply* flush_reply = s3c_multipart_upload_perform(
+            mp, (const uint8_t*)mp->part_buf.ptr, mp->part_buf.len
+        );
+
+        if (flush_reply->error != NULL) {
+            return flush_reply;
+        }
+
+        s3c_reply_free(flush_reply);
+        mp->part_buf.len = 0;
     }
 
     return s3c_multipart_upload_finish(
@@ -1250,15 +1258,11 @@ s3cReply* s3c_put_object_from_file(s3cClient* client,
     size_t file_size = ftell(fp);
     fseek(fp, 0, SEEK_SET);
 
-    StreamRead stream_rd = {
-        .fn_read = &fn_stream_read_file,
-        .ctx = {
-            .total_size = file_size,
-            .cursor = 0,
-            .opaque = &bf,
-            .confs = &client->confs,
-        }
-    };
+    StreamRead stream_rd = make_stream_rd_file((StreamContext){
+        .total_size = file_size,
+        .opaque = &bf,
+        .confs = &client->confs,
+    });
 
     OpArgs args = {
         .bucket = bucket,
@@ -1286,24 +1290,13 @@ s3cReply* s3c_put_object_from_file_multipart(s3cClient* client,
                                              const s3cKVL* headers,
                                              const s3cMultipartOpts* opts)
 {
-    s3cMultipartOpts default_opts = {
-        .part_size = 6 * 1024 * 1024,
-        .max_send_retries = 2,
-    };
-
-    if (opts == NULL) {
-        opts = &default_opts;
-    }
-
     s3cReply* err = NULL;
 
     if (client == NULL) {
         return s3c_reply_alloc("provided arguments missing value for <client>");
     }
 
-    err = check_arg_bucket_key(bucket, object_key);
-
-    if (err != NULL) {
+    if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
         return err;
     }
 
@@ -1311,46 +1304,48 @@ s3cReply* s3c_put_object_from_file_multipart(s3cClient* client,
         return err;
     }
 
-    s3cReply* reply = NULL;
-    StrBuf upload_id = str_init_conf(0, client->confs.str_buf_max_cap_reserve_mb);
-
     FILE* fp = fopen(file, "r");
 
     if (fp == NULL) {
-        reply = s3c_reply_alloc("failed to open file for read");
-        goto cleanup_and_ret;
+        return s3c_reply_alloc("failed to open file for read");
     }
 
-    reply = s3c_multipart_upload_init(
-        client, bucket, object_key, headers,
-        &upload_id
-    );
+    s3cMultipart* mp = NULL;
+    s3cReply* reply = s3c_multipart_init(client, bucket, object_key, headers, opts, &mp);
 
-    if (reply->error) {
-        goto cleanup_and_ret;
+    if (reply->error != NULL) {
+        fclose(fp);
+        return reply;
     }
 
     s3c_reply_free(reply);
 
-    reply = s3c_multipart_upload_run(
-        client, bucket, object_key, fp, upload_id.ptr, opts
-    );
+    uint8_t* chunk_buf = malloc(mp->part_size);
 
-    if (reply->error) {
-        s3cReply* rep_abort = s3c_multipart_upload_abort(
-            client, bucket, object_key, upload_id.ptr
-        );
+    while (1) {
+        size_t bytes_read = fread(chunk_buf, 1, mp->part_size, fp);
 
-        s3c_reply_free(rep_abort);
-        goto cleanup_and_ret;
+        if (bytes_read < 1) {
+            break;
+        }
+
+        reply = s3c_multipart_upload_part(mp, chunk_buf, bytes_read);
+
+        if (reply->error != NULL) {
+            s3cReply* abort_reply = s3c_multipart_abort(mp);
+            s3c_reply_free(abort_reply);
+            goto cleanup_and_ret;
+        }
+
+        s3c_reply_free(reply);
     }
 
+    reply = s3c_multipart_complete(mp);
 
 cleanup_and_ret:
-    if (fp != NULL) {
-        fclose(fp);
-    }
-    str_destroy(&upload_id);
+    free(chunk_buf);
+    fclose(fp);
+    s3c_multipart_free(mp);
 
     return reply;
 }
@@ -1377,8 +1372,8 @@ s3cReply* s3c_head_object(s3cClient* client,
 }
 
 s3cReply* s3c_copy_object(s3cClient* client,
-                              const char* src_bucket, const char* src_key,
-                              const char* dst_bucket, const char* dst_key)
+                          const char* src_bucket, const char* src_key,
+                          const char* dst_bucket, const char* dst_key)
 {
     s3cReply* err = NULL;
 
@@ -1496,8 +1491,8 @@ s3cReply* s3c_delete_bucket(s3cClient* client, const char* bucket)
 }
 
 s3cReply* s3c_get_bucket_config(s3cClient* client,
-                                    const char* bucket,
-                                    const char* config_name)
+                                const char* bucket,
+                                const char* config_name)
 {
     s3cReply* err = NULL;
 
@@ -1540,9 +1535,9 @@ s3cReply* s3c_get_bucket_config(s3cClient* client,
 }
 
 s3cReply* s3c_set_bucket_config(s3cClient* client,
-                                    const char* bucket,
-                                    const char* config_name,
-                                    const char* body)
+                                const char* bucket,
+                                const char* config_name,
+                                const char* body)
 {
     s3cReply* err = NULL;
 
@@ -1695,8 +1690,8 @@ static s3cReply* list_objects_page(s3cClient* client,
 }
 
 s3cReply* s3c_list_objects(s3cClient* client,
-                              const char* bucket,
-                              const s3cListObjectsOpts* opts)
+                           const char* bucket,
+                           const s3cListObjectsOpts* opts)
 {
     s3cReply* err = NULL;
 
@@ -1795,7 +1790,7 @@ static StrBuf get_req_host(const s3cClient* client)
     return endpoint;
 }
 
-static void op_context_init(OpContext* op, OpArgs args, const s3cClient* client, s3cReply* reply)
+static void op_context_init(OpContext* op, OpArgs args, s3cClient* client, s3cReply* reply)
 {
     op->ok = false;
     op->reply = reply;
@@ -1826,22 +1821,11 @@ static void op_context_init(OpContext* op, OpArgs args, const s3cClient* client,
         return;
     }
 
-    OsslContext* octx = calloc(1, sizeof(OsslContext));
-
-    op->ossl_ctx = octx;
-    const char* err = ossl_init(op->ossl_ctx, client->ssl_ctx);
-
-    if (err != NULL) {
-        op_set_error(op, err);
-        return;
-    }
-
     op->ok = true;
 }
 
 static void op_context_free(OpContext* op)
 {
-    ossl_free(op->ossl_ctx);
     free(op);
 }
 
@@ -2314,7 +2298,7 @@ cleanup_and_ret:
 
 static void op_run_request(OpContext* op, const char* html_verb)
 {
-    uint32_t max_cap_reserve_mb = op->client->confs.str_buf_max_cap_reserve_mb;
+    uint64_t max_cap_reserve_mb = op->client->confs.str_buf_max_cap_reserve_mb;
     StrBuf request = str_init_conf(128, max_cap_reserve_mb),
            request_sig = str_init_conf(128, max_cap_reserve_mb),
            sig_headers = str_init_conf(128, max_cap_reserve_mb),
@@ -2413,7 +2397,11 @@ static void op_run_request(OpContext* op, const char* html_verb)
     }
 
     s3c_kvl_upsert(&headers, "authorization", auth_header.ptr);
-    s3c_kvl_upsert(&headers, "connection", "close");
+    if (op->client->confs.client_idle_sec_max > 0) {
+        s3c_kvl_upsert(&headers, "connection", "keep-alive");
+    } else {
+        s3c_kvl_upsert(&headers, "connection", "close");
+    }
 
     // build http request head
     str_push_many(
@@ -2432,7 +2420,29 @@ static void op_run_request(OpContext* op, const char* html_verb)
 
     str_push_cstr(&request, "\r\n");
 
-    op_send_request(op, &request);
+    op_send_request(op, html_verb, &request);
+
+    if (!op->ok && op->io_failed) {
+        // conection stale / transient net io error, reset state and try again
+        const char* reset_err = op->args.stream_rd != NULL
+            ? op->args.stream_rd->fn_reset(&op->args.stream_rd->ctx)
+            : NULL;
+
+        if (reset_err != NULL) {
+            op_set_error_fmt(op,
+                            "http send retry failed: %s, net io error: %s",
+                            reset_err, op->reply->error);
+            goto cleanup_and_ret;
+        }
+
+
+        s3c_reply_free(op->reply);
+        op->reply = s3c_reply_alloc(NULL);
+        op->ok = true;
+        op->io_failed = false;
+
+        op_send_request(op, html_verb, &request);
+    }
 
 cleanup_and_ret:
     str_destroy(&request);
@@ -2489,16 +2499,24 @@ static const char* ossl_init(OsslContext* octx, SSL_CTX* ssl_ctx)
     return NULL;
 }
 
+static void ossl_disconnect(OsslContext* octx)
+{
+    if (octx == NULL || octx->ssl == NULL) {
+        return;
+    }
+
+    SSL_set_shutdown(octx->ssl, SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
+    SSL_free(octx->ssl);
+    octx->ssl = NULL;
+}
+
 static void ossl_free(OsslContext* octx)
 {
     if (octx == NULL) {
         return;
     }
 
-    // SSL_free frees the BIO chain; since the BIO was created with BIO_CLOSE
-    // the socket fd is closed as part of that — no manual close needed here.
-    SSL_free(octx->ssl);
-
+    ossl_disconnect(octx);
     free(octx);
 }
 
@@ -2526,7 +2544,7 @@ static const char* ossl_proc_io_res(OsslContext* octx, int io_res)
     return  "unknown net error occured";
 }
 
-static BIO* create_socket_bio(const char *host, const char *proto, uint32_t net_timeout_sec)
+static BIO* create_socket_bio(const char *host, const char *proto, uint64_t net_timeout_sec)
 {
     BIO_ADDRINFO* bio_addr_info;
 
@@ -2544,7 +2562,7 @@ static BIO* create_socket_bio(const char *host, const char *proto, uint32_t net_
     const BIO_ADDRINFO *ai = NULL;
 
     struct timeval timeout;
-    timeout.tv_sec = net_timeout_sec;
+    timeout.tv_sec = (time_t)net_timeout_sec;
     timeout.tv_usec = 0;
 
     for (ai = bio_addr_info; sock == -1 && ai != NULL; ai = BIO_ADDRINFO_next(ai)) {
@@ -2593,7 +2611,7 @@ static BIO* create_socket_bio(const char *host, const char *proto, uint32_t net_
     return bio;
 }
 
-static const char* ossl_connect(OsslContext* octx, const char* host, uint32_t net_timeout_sec)
+static const char* ossl_connect(OsslContext* octx, const char* host, uint64_t net_timeout_sec)
 {
     BIO* bio = create_socket_bio(host, "https", net_timeout_sec);
 
@@ -2738,24 +2756,25 @@ static bool http_resp_code_is_ok(unsigned http_resp_code)
     return http_resp_code < 300 && http_resp_code > 199;
 }
 
-static const char* ossl_io_read(OsslContext* octx,
-                                StrBuf* recv_buf, size_t max_bytes_to_read,
-                                size_t* out_bytes_recv)
+static bool op_ossl_io_read(OpContext* op,
+                            StrBuf* recv_buf, size_t max_bytes_to_read,
+                            size_t* out_bytes_recv)
 {
     *out_bytes_recv = 0;
-    int io_res = 0;
+    OsslContext* octx = op->client->conn;
 
     size_t min_cap = recv_buf->len + max_bytes_to_read + 1;
     size_t set_cap = str_set_cap(recv_buf, min_cap);
 
     if (set_cap < min_cap) {
-        return "http reply allocation failed";
+        op_set_error(op, "http reply allocation failed");
+        return false;
     }
 
     char* wptr = recv_buf->ptr + recv_buf->len;
 
     errno = 0;
-    io_res = SSL_read_ex(
+    int io_res = SSL_read_ex(
         octx->ssl, wptr, max_bytes_to_read,
         out_bytes_recv
     );
@@ -2763,28 +2782,32 @@ static const char* ossl_io_read(OsslContext* octx,
     const char* err = ossl_proc_io_res(octx, io_res);
 
     if (err) {
-        return err;
+        op->io_failed = true;
+        op_set_error_fmt(op, "failed to read http reply: %s", err);
+        return false;
     }
 
     if (*out_bytes_recv == 0 &&
         SSL_get_error(octx->ssl, 0) != SSL_ERROR_ZERO_RETURN) {
 
-        return "host hang up";
+        op->io_failed = true;
+        op_set_error(op, "failed to read http reply: host hang up");
+        return false;
     }
 
     recv_buf->len += *out_bytes_recv;
     recv_buf->ptr[recv_buf->len] = '\0';
 
-    return NULL;
+    return true;
 }
 
-static const char* ossl_io_write(OsslContext* octx, const char* data, size_t data_size)
+static bool op_ossl_io_write(OpContext* op, const char* data, size_t data_size)
 {
+    OsslContext* octx = op->client->conn;
     size_t bytes_sent = 0;
-    int io_res = 0;
 
     errno = 0;
-    io_res = SSL_write_ex(
+    int io_res = SSL_write_ex(
         octx->ssl, data, data_size,
         &bytes_sent
     );
@@ -2792,208 +2815,560 @@ static const char* ossl_io_write(OsslContext* octx, const char* data, size_t dat
     const char* err = ossl_proc_io_res(octx, io_res);
 
     if (err) {
-        return err;
+        op->io_failed = true;
+        op_set_error_fmt(op, "failed to send http request: %s", err);
+        return false;
     }
 
     if (bytes_sent < data_size) {
-        return "SSL transmission error";
+        op->io_failed = true;
+        op_set_error(op, "failed to send http request: SSL transmission error");
+        return false;
+    }
+
+    return true;
+}
+
+static bool parse_reply_content_length(s3cKVL* rep_headers, int64_t* out_len)
+{
+    *out_len = 0;
+
+    s3cKVL* ct_len = s3c_kvl_find(rep_headers, "content-length");
+    if (ct_len == NULL) {
+        return false;
+    }
+
+    errno = 0;
+    char* p_end = NULL;
+    int64_t res = strtol(ct_len->value, &p_end, 10);
+
+    if (errno != 0 || p_end == NULL ||
+        *p_end != '\0' || p_end == ct_len->value) {
+        return false;
+    }
+
+    *out_len = res;
+    return true;
+}
+
+static bool header_has_token(s3cKVL* headers, const char* name, const char* token)
+{
+    s3cKVL* hdr = s3c_kvl_find(headers, name);
+    if (hdr == NULL || hdr->value == NULL) {
+        return false;
+    }
+
+    const char* p = hdr->value;
+    size_t tok_len = strlen(token);
+
+    while (*p != '\0') {
+        while (*p == ' ' || *p == '\t' || *p == ',') {
+            p += 1;
+        }
+
+        const char* start = p;
+        while (*p != '\0' && *p != ',') {
+            p += 1;
+        }
+
+        const char* end = p;
+        while (end > start && (end[-1] == ' ' || end[-1] == '\t')) {
+            end -= 1;
+        }
+
+        if ((size_t)(end - start) == tok_len) {
+            bool match = true;
+            for (size_t i = 0; i < tok_len; i++) {
+                char a = (char)tolower((unsigned char)start[i]);
+                char b = (char)tolower((unsigned char)token[i]);
+                if (a != b) {
+                    match = false;
+                    break;
+                }
+            }
+
+            if (match) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static const char* emit_reply_body(OpContext* op,
+                                   bool http_resp_code_ok,
+                                   const char* bytes, size_t num_bytes,
+                                   StrBuf* body_buf)
+{
+    if (num_bytes == 0) {
+        return NULL;
+    }
+
+    if (op->args.stream_wr != NULL && http_resp_code_ok) {
+        return op->args.stream_wr->fn_write(bytes, num_bytes, &op->args.stream_wr->ctx);
+    }
+
+    if (str_push(body_buf, bytes, num_bytes) < num_bytes) {
+        return "http reply allocation failed";
     }
 
     return NULL;
 }
 
-static int64_t parse_reply_content_length(s3cKVL* rep_headers)
+static const char* parse_chunk_size_line(const char* line, size_t line_len, size_t* out_chunk_size)
 {
-    s3cKVL* ct_len = s3c_kvl_find(rep_headers, "content-length");
+    size_t end = 0;
 
-    if (ct_len == NULL) {
-        return -1;
+    while (end < line_len && line[end] != ';') {
+        end += 1;
     }
 
-    errno = 0;
-    char* p_end;
-    int64_t res = strtol(ct_len->value, &p_end, 10);
-
-    if (errno != 0 || p_end == NULL ||
-        *p_end != '\0' || p_end == ct_len->value) {
-
-        return -1;
+    if (end < 1) {
+        return "http chunked reply invalid chunk size";
     }
 
-    return res;
+    uint64_t chunk_size = 0;
+    for (size_t i = 0; i < end; i++) {
+        char c = line[i];
+        uint8_t hex;
+
+        if (c >= '0' && c <= '9') {
+            hex = (uint8_t)(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            hex = (uint8_t)(10 + c - 'a');
+        } else if (c >= 'A' && c <= 'F') {
+            hex = (uint8_t)(10 + c - 'A');
+        } else {
+            return "http chunked reply invalid chunk size";
+        }
+
+        chunk_size = chunk_size * 16 + hex;
+    }
+
+    *out_chunk_size = (size_t)chunk_size;
+    return NULL;
 }
 
-static void op_read_reply(OpContext* op)
+typedef struct {
+    int64_t body_received;
+    int64_t chunk_bytes_left;
+    size_t chunk_parse_pos;
+    bool done;
+} ChunkedState;
+
+static void parse_chunked_body(OpContext* op,
+                               bool http_resp_code_ok,
+                               StrBuf* recv_buf,
+                               StrBuf* body_buf,
+                               ChunkedState* st)
+{
+    const char* proc_err = NULL;
+
+    while (1) {
+        if (st->chunk_bytes_left < 0) {
+            const char* lstart = recv_buf->ptr + st->chunk_parse_pos;
+            size_t lspace = recv_buf->len - st->chunk_parse_pos;
+            char* lbreak = memchr(lstart, '\n', lspace);
+
+            if (lbreak == NULL) {
+                break;
+            }
+
+            if (lbreak == lstart || lbreak[-1] != '\r') {
+                op_set_error(op, "http chunked reply malformed line ending");
+                return;
+            }
+
+            size_t line_len = (size_t)(lbreak - lstart - 1);
+            size_t chunk_size = 0;
+            const char* chunk_err = parse_chunk_size_line(
+                lstart, line_len, &chunk_size
+            );
+
+            if (chunk_err != NULL) {
+                op_set_error(op, chunk_err);
+                return;
+            }
+
+            st->chunk_parse_pos = (size_t)(lbreak - recv_buf->ptr + 1);
+
+            if (chunk_size == 0) {
+                const char* trailers = recv_buf->ptr + st->chunk_parse_pos;
+                char* trailers_end = strstr(trailers, "\r\n\r\n");
+
+                if (trailers_end == NULL) {
+                    break;
+                }
+
+                st->chunk_parse_pos = (size_t)(trailers_end - recv_buf->ptr + 4);
+                st->done = true;
+                break;
+            }
+
+            st->chunk_bytes_left = (int64_t)chunk_size;
+        }
+
+        if (st->chunk_bytes_left > 0) {
+            size_t avail = recv_buf->len - st->chunk_parse_pos;
+            if (avail < 1) {
+                break;
+            }
+
+            size_t to_emit = avail;
+            if ((int64_t)to_emit > st->chunk_bytes_left) {
+                to_emit = (size_t)st->chunk_bytes_left;
+            }
+
+            proc_err = emit_reply_body(
+                op, http_resp_code_ok,
+                recv_buf->ptr + st->chunk_parse_pos, to_emit, body_buf
+            );
+
+            if (proc_err != NULL) {
+                op_set_error_fmt(op, "http reply recv failed: %s", proc_err);
+                return;
+            }
+
+            st->body_received += (int64_t)to_emit;
+            st->chunk_parse_pos += to_emit;
+            st->chunk_bytes_left -= (int64_t)to_emit;
+
+            if (st->chunk_bytes_left > 0) {
+                break;
+            }
+
+            if (recv_buf->len - st->chunk_parse_pos < 2) {
+                break;
+            }
+
+            if (recv_buf->ptr[st->chunk_parse_pos] != '\r' ||
+                recv_buf->ptr[st->chunk_parse_pos + 1] != '\n') {
+                op_set_error(op, "http chunked reply malformed chunk terminator");
+                return;
+            }
+
+            st->chunk_parse_pos += 2;
+            st->chunk_bytes_left = -1;
+        }
+    }
+
+    if (st->chunk_parse_pos > 0) {
+        size_t left = recv_buf->len - st->chunk_parse_pos;
+        memmove(recv_buf->ptr, recv_buf->ptr + st->chunk_parse_pos, left);
+        recv_buf->len = left;
+        recv_buf->ptr[recv_buf->len] = '\0';
+        st->chunk_parse_pos = 0;
+    }
+}
+
+static void op_read_reply(OpContext* op, const char* html_verb)
 {
     const size_t RECV_CAP = 1024 * 1024;
     StrBuf recv_buf = str_init_conf(0, op->client->confs.str_buf_max_cap_reserve_mb);
+    StrBuf body_buf = str_init_conf(0, op->client->confs.str_buf_max_cap_reserve_mb);
+
+    enum {
+        BODY_NONE = 0,
+        BODY_CONTENT_LENGTH,
+        BODY_CHUNKED,
+        BODY_UNTIL_CLOSE,
+    } body_mode = BODY_NONE;
 
     bool headers_parsed = false;
+    bool body_done = false;
     unsigned http_resp_code = 0;
     bool http_resp_code_ok = false;
-    int ssl_shtudown_state = 0;
+    int64_t content_length = 0;
+    int64_t body_received = 0;
+
+    ChunkedState chunk_st = {
+        .body_received = 0,
+        .chunk_bytes_left = -1,
+        .chunk_parse_pos = 0,
+        .done = false,
+    };
+
+    op->can_reuse_conn = false;
 
     for (;;) {
+        if (headers_parsed) {
+            const char* proc_err = NULL;
 
-        if (op->args.stream_wr != NULL && recv_buf.len > 0 && http_resp_code_ok) {
-
-            const char* write_err = op->args.stream_wr->fn_write(
-                recv_buf.ptr, recv_buf.len, &op->args.stream_wr->ctx
-            );
-
-            if (write_err != NULL) {
-                op_set_error_fmt(op, "http reply recv failed: %s", write_err);
-                goto cleanup_and_ret;
+            if (body_mode == BODY_NONE) {
+                if (recv_buf.len == 0) {
+                    body_done = true;
+                } else {
+                    body_mode = BODY_UNTIL_CLOSE;
+                }
             }
 
-            recv_buf.len = 0;
+            if (body_mode == BODY_CONTENT_LENGTH && recv_buf.len > 0) {
+                int64_t bytes_left = content_length - body_received;
+                if (bytes_left < 0) {
+                    op_set_error(op, "http reply internal parse error");
+                    goto cleanup_and_ret;
+                }
+
+                size_t to_emit = recv_buf.len;
+                if ((int64_t)to_emit > bytes_left) {
+                    to_emit = (size_t)bytes_left;
+                }
+
+                proc_err = emit_reply_body(
+                    op, http_resp_code_ok,
+                    recv_buf.ptr, to_emit, &body_buf
+                );
+
+                if (proc_err != NULL) {
+                    op_set_error_fmt(op, "http reply recv failed: %s", proc_err);
+                    goto cleanup_and_ret;
+                }
+
+                body_received += (int64_t)to_emit;
+
+                if (to_emit < recv_buf.len) {
+                    op_set_error(op, "http reply body larger than content-length");
+                    goto cleanup_and_ret;
+                }
+
+                recv_buf.len = 0;
+                if (recv_buf.ptr != NULL) {
+                    recv_buf.ptr[0] = '\0';
+                }
+
+                if (body_received >= content_length) {
+                    body_done = true;
+                }
+            }
+
+            if (body_mode == BODY_UNTIL_CLOSE && recv_buf.len > 0) {
+                proc_err = emit_reply_body(
+                    op, http_resp_code_ok,
+                    recv_buf.ptr, recv_buf.len, &body_buf
+                );
+
+                if (proc_err != NULL) {
+                    op_set_error_fmt(op, "http reply recv failed: %s", proc_err);
+                    goto cleanup_and_ret;
+                }
+
+                body_received += (int64_t)recv_buf.len;
+                recv_buf.len = 0;
+                if (recv_buf.ptr != NULL) {
+                    recv_buf.ptr[0] = '\0';
+                }
+            }
+
+            if (body_mode == BODY_CHUNKED) {
+                parse_chunked_body(op, http_resp_code_ok, &recv_buf, &body_buf, &chunk_st);
+                if (!op->ok) {
+                    goto cleanup_and_ret;
+                }
+                if (chunk_st.done) {
+                    body_done = true;
+                }
+            }
+
+            if (body_done) {
+                break;
+            }
         }
 
         size_t bytes_recv = 0;
 
-        const char* err = ossl_io_read(
-            op->ossl_ctx,
-            &recv_buf, RECV_CAP,
-            &bytes_recv
-        );
-
-        if (err != NULL) {
-            op_set_error_fmt(op, "failed to read http reply: %s", err);
+        if (!op_ossl_io_read(op, &recv_buf, RECV_CAP, &bytes_recv)) {
             goto cleanup_and_ret;
         }
 
         if (bytes_recv == 0) {
-            break;
-        }
-
-        if (headers_parsed) {
-            continue;
-        }
-
-        const char* delim = strstr(recv_buf.ptr, "\r\n\r\n");
-
-        if (delim == NULL || delim == recv_buf.ptr) {
-            continue;
-        }
-
-        ptrdiff_t block_len = delim - recv_buf.ptr;
-
-        if (block_len < 4) {
-            op_set_error(op, "http reply internal parse error");
-            goto cleanup_and_ret;
-        }
-
-        const char* parse_err = parse_header_block(
-            recv_buf.ptr, block_len,
-            &op->reply->headers,
-            &http_resp_code
-        );
-
-        if (parse_err != NULL) {
-            op_set_error(op, parse_err);
-            goto cleanup_and_ret;
-        }
-
-        http_resp_code_ok = http_resp_code_is_ok(http_resp_code);
-
-        assert(recv_buf.len >= (unsigned)block_len + 4);
-
-        size_t to_copy = recv_buf.len - block_len - 4;
-
-        memmove(recv_buf.ptr, recv_buf.ptr + block_len + 4, to_copy);
-        recv_buf.len = to_copy;
-        recv_buf.ptr[recv_buf.len] = '\0';
-
-        headers_parsed = true;
-
-        if (op->args.stream_wr != NULL) {
-            int64_t rep_len = parse_reply_content_length(op->reply->headers);
-            if (rep_len > 0) {
-                op->args.stream_wr->ctx.total_size = rep_len;
+            if (!headers_parsed) {
+                // server closed connection, most probably becasue client idled too long
+                op->io_failed = true;
+                op_set_error(op, "failed to read http reply headers");
+                goto cleanup_and_ret;
             }
+
+            if (body_mode == BODY_UNTIL_CLOSE || body_mode == BODY_NONE) {
+                body_done = true;
+                break;
+            }
+
+            op_set_error(op, "http reply ended before body was fully received");
+            goto cleanup_and_ret;
+        }
+
+        if (!headers_parsed) {
+            const char* delim = strstr(recv_buf.ptr, "\r\n\r\n");
+            if (delim == NULL || delim == recv_buf.ptr) {
+                continue;
+            }
+
+            ptrdiff_t block_len = delim - recv_buf.ptr;
+            if (block_len < 4) {
+                op_set_error(op, "http reply internal parse error");
+                goto cleanup_and_ret;
+            }
+
+            const char* parse_err = parse_header_block(
+                recv_buf.ptr, (size_t)block_len,
+                &op->reply->headers,
+                &http_resp_code
+            );
+
+            if (parse_err != NULL) {
+                op_set_error(op, parse_err);
+                goto cleanup_and_ret;
+            }
+
+            http_resp_code_ok = http_resp_code_is_ok(http_resp_code);
+
+            size_t body_start = (size_t)block_len + 4;
+            size_t body_bytes = recv_buf.len - body_start;
+
+            memmove(recv_buf.ptr, recv_buf.ptr + body_start, body_bytes);
+            recv_buf.len = body_bytes;
+            recv_buf.ptr[recv_buf.len] = '\0';
+
+            headers_parsed = true;
+
+            bool is_head_req = strcmp(html_verb, "HEAD") == 0;
+            bool no_body_resp = is_head_req ||
+                                http_resp_code == 204 ||
+                                http_resp_code == 304;
+
+            bool is_chunked = header_has_token(
+                op->reply->headers, "transfer-encoding", "chunked"
+            );
+            bool conn_close = header_has_token(
+                op->reply->headers, "connection", "close"
+            );
+
+            bool has_content_length = parse_reply_content_length(op->reply->headers,
+                                                                 &content_length);
+
+            if (no_body_resp) {
+                body_mode = BODY_NONE;
+
+            } else if (is_chunked) {
+                body_mode = BODY_CHUNKED;
+
+            } else if (has_content_length) {
+                // some servers set content-length: -1 for body-less replies
+                if (content_length <= 0) {
+                    body_mode = BODY_NONE;
+
+                } else {
+                    body_mode = BODY_CONTENT_LENGTH;
+                    if (op->args.stream_wr != NULL && http_resp_code_ok) {
+                        op->args.stream_wr->ctx.total_size = (size_t)content_length;
+                    }
+                }
+            } else {
+                body_mode = BODY_UNTIL_CLOSE;
+            }
+
+            op->can_reuse_conn = !conn_close && body_mode != BODY_UNTIL_CLOSE;
         }
     }
 
-    op_proc_reply(op, &recv_buf, http_resp_code);
+    op_proc_reply(op, &body_buf, http_resp_code);
 
 cleanup_and_ret:
     if (!op->ok) {
-        // force immediate close on error
-        SSL_set_shutdown(op->ossl_ctx->ssl,
-                         SSL_SENT_SHUTDOWN | SSL_RECEIVED_SHUTDOWN);
-    } else {
-        ssl_shtudown_state = SSL_get_shutdown(op->ossl_ctx->ssl);
-
-        if (ssl_shtudown_state != SSL_RECEIVED_SHUTDOWN) {
-            SSL_shutdown(op->ossl_ctx->ssl);
-        }
+        op->can_reuse_conn = false;
     }
 
     str_destroy(&recv_buf);
+    str_destroy(&body_buf);
 }
 
-static void op_send_request(OpContext* op, StrBuf* rq_head)
+static const char* client_ensure_conn(s3cClient* client, const char* host)
+{
+    if (client->conn == NULL) {
+        client->conn = calloc(1, sizeof(OsslContext));
+        if (client->conn == NULL) {
+            return "failed to allocate connection context";
+        }
+    }
+
+    if (client->conn->ssl != NULL) {
+
+        time_t idle_sec = time(NULL) - client->last_used;
+
+        if (client->last_used > 0 && idle_sec >= (time_t)client->confs.client_idle_sec_max) {
+            ossl_disconnect(client->conn);
+
+        } else {
+            return NULL;
+        }
+    }
+
+    const char* err = ossl_init(client->conn, client->ssl_ctx);
+    if (err != NULL) {
+        return err;
+    }
+
+    err = ossl_connect(client->conn, host, client->confs.net_io_timeout_sec);
+    if (err != NULL) {
+        ossl_disconnect(client->conn);
+        return err;
+    }
+
+    return NULL;
+}
+
+static void op_send_request(OpContext* op, const char* html_verb, StrBuf* rq_head)
 {
     StrBuf endpoint = get_req_host(op->client);
 
-    const char* conn_err = ossl_connect(
-        op->ossl_ctx,
-        endpoint.ptr,
-        op->client->confs.net_io_timeout_sec
-    );
-
-    if (conn_err) {
+    const char* conn_err = client_ensure_conn(op->client, endpoint.ptr);
+    if (conn_err != NULL) {
+        op->io_failed = true;
         op_set_error(op, conn_err);
         goto cleanup_and_ret;
     }
 
-    const char* io_err = ossl_io_write(
-        op->ossl_ctx, rq_head->ptr, rq_head->len
-    );
-
-    if (io_err != NULL) {
-        op_set_error_fmt(op, "failed to send http request: %s", io_err);
+    if (!op_ossl_io_write(op, rq_head->ptr, rq_head->len)) {
         goto cleanup_and_ret;
     }
 
-    if (op->args.stream_rd == NULL) {
-        op_read_reply(op);
-        goto cleanup_and_ret;
-    }
+    if (op->args.stream_rd != NULL) {
+        const size_t SEND_CHUNK_SZ = 1024 * 1024;
 
-    const size_t SEND_CHUNK_SZ = 1024 * 1024;
+        while (1) {
+            size_t bytes_to_send = 0;
+            const char* bytes_ptr = NULL;
 
-    while (1) {
-        size_t bytes_to_send;
-        const char* bytes_ptr;
+            const char* rd_err = op->args.stream_rd->fn_read(
+                SEND_CHUNK_SZ, &op->args.stream_rd->ctx,
+                &bytes_ptr, &bytes_to_send
+            );
 
-        const char* io_err = op->args.stream_rd->fn_read(
-            SEND_CHUNK_SZ, &op->args.stream_rd->ctx,
-            &bytes_ptr, &bytes_to_send
-        );
+            if (rd_err != NULL) {
+                op_set_error_fmt(op, "failed to read request body: %s", rd_err);
+                goto cleanup_and_ret;
+            }
 
-        if (io_err != NULL) {
-            op_set_error_fmt(op, "failed to send http request: %s", io_err);
-            goto cleanup_and_ret;
-        }
+            if (bytes_to_send < 1) {
+                break;
+            }
 
-        if (bytes_to_send < 1) {
-            break;
-        }
-
-        io_err = ossl_io_write(
-            op->ossl_ctx, bytes_ptr, bytes_to_send
-        );
-
-        if (io_err != NULL) {
-            op_set_error_fmt(op, "failed to send http request: %s", io_err);
-            goto cleanup_and_ret;
+            if (!op_ossl_io_write(op, bytes_ptr, bytes_to_send)) {
+                goto cleanup_and_ret;
+            }
         }
     }
 
-    op_read_reply(op);
+    op_read_reply(op, html_verb);
 
 cleanup_and_ret:
+    if (!op->ok || !op->can_reuse_conn) {
+        ossl_disconnect(op->client->conn);
+    } else {
+        op->client->last_used = time(NULL);
+    }
+
     str_destroy(&endpoint);
 }
 
@@ -3190,7 +3565,7 @@ static StrBuf str_init(size_t cap)
     return str_init_conf(cap, S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB);
 }
 
-static StrBuf str_init_conf(size_t cap, uint32_t max_cap_reserve_mb)
+static StrBuf str_init_conf(size_t cap, uint64_t max_cap_reserve_mb)
 {
     char* ptr = cap > 0 ? calloc(1, cap + 1) : NULL;
 
@@ -3250,7 +3625,7 @@ static size_t str_push(StrBuf* s, const char* a, size_t a_len)
             s->cap = 64;
         }
 
-        uint32_t max_cap_reserve_mb = s->max_cap_reserve_mb > 0
+        uint64_t max_cap_reserve_mb = s->max_cap_reserve_mb > 0
             ? s->max_cap_reserve_mb
             : S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB;
 
