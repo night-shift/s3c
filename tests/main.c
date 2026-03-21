@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 const char* TEST_BUCKET = "s3c-tests";
+const char* TEST_BUCKET_CONFIG = "s3c-tests-config";
 const char* LOCAL_OBJ_FILE = "tests/obj_file";
 
 typedef struct {
@@ -544,30 +545,7 @@ bool run_local_tests(void)
     return ok;
 }
 
-bool create_test_bucket(s3cClient* client)
-{
-    bool ok = true;
 
-    s3cReply* reply = s3c_create_bucket(client, TEST_BUCKET, NULL);
-
-    if (reply->error != NULL && reply->http_resp_code != 409) {
-        ok = false;
-    }
-
-    s3c_reply_free(reply);
-
-    return ok;
-}
-
-bool delete_test_bucket(s3cClient* client)
-{
-    s3cReply* reply = s3c_delete_bucket(client, TEST_BUCKET);
-
-    bool ok = reply->error == NULL;
-    s3c_reply_free(reply);
-
-    return ok;
-}
 
 bool fetch_and_compare_file(s3cClient* client,
                             const char* obj_key,
@@ -645,8 +623,6 @@ bool test_big_object(s3cClient* client)
         .value = (char*)rt_content_type,
         .next = NULL
     };
-
-    create_test_bucket(client);
 
     bool all_good = false;
     char* rt_data = calloc(rt_data_size, 1);
@@ -828,7 +804,6 @@ cleanup_and_ret:
     free(filebuf);
 
     remove(LOCAL_OBJ_FILE);
-    delete_test_bucket(client);
 
     return all_good;
 }
@@ -850,15 +825,6 @@ bool test_multipart_api(s3cClient* client)
     for (size_t i = 0; i < total_size; i++) {
         data[i] = (char)(i % 251);
     }
-
-    log_info("multipart api: setup...");
-
-    if (!create_test_bucket(client)) {
-        log_err("error: failed to create test bucket\n");
-        goto cleanup_and_ret;
-    }
-
-    log_info("ok\n");
 
     log_info("multipart api: init...");
 
@@ -996,7 +962,6 @@ cleanup_and_ret:
     s3cReply* del = s3c_delete_object(client, TEST_BUCKET, object_key);
     s3c_reply_free(del);
 
-    delete_test_bucket(client);
     free(data);
 
     return all_good;
@@ -1004,23 +969,8 @@ cleanup_and_ret:
 
 bool test_bucket_config(s3cClient* client)
 {
-    const char* config_bucket = "s3c-tests-config";
     bool all_good = false;
     s3cReply* reply = NULL;
-
-    log_info("bucket config: setup...");
-
-    reply = s3c_create_bucket(client, config_bucket, NULL);
-    if (reply->error != NULL && reply->http_resp_code != 409) {
-        log_err("error: failed to create config test bucket: %s\n", reply->error);
-        s3c_reply_free(reply);
-        reply = NULL;
-        goto cleanup_and_ret;
-    }
-    s3c_reply_free(reply);
-    reply = NULL;
-
-    log_info("ok\n");
 
     // set a valid lifecycle config
     log_info("bucket config: set lifecycle...");
@@ -1035,7 +985,7 @@ bool test_bucket_config(s3cClient* client)
         "</Rule>"
         "</LifecycleConfiguration>";
 
-    reply = s3c_set_bucket_config(client, config_bucket, "lifecycle", lifecycle_xml);
+    reply = s3c_set_bucket_config(client, TEST_BUCKET_CONFIG, "lifecycle", lifecycle_xml);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -1049,7 +999,7 @@ bool test_bucket_config(s3cClient* client)
     // get the lifecycle config back
     log_info("bucket config: get lifecycle...");
 
-    reply = s3c_get_bucket_config(client, config_bucket, "lifecycle");
+    reply = s3c_get_bucket_config(client, TEST_BUCKET_CONFIG, "lifecycle");
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -1078,7 +1028,7 @@ bool test_bucket_config(s3cClient* client)
     // send garbled xml — expect S3 to reject it
     log_info("bucket config: set garbled xml...");
 
-    reply = s3c_set_bucket_config(client, config_bucket, "lifecycle",
+    reply = s3c_set_bucket_config(client, TEST_BUCKET_CONFIG, "lifecycle",
                                    "<LifecycleConfiguration><not closed");
 
     if (reply->error == NULL) {
@@ -1093,7 +1043,7 @@ bool test_bucket_config(s3cClient* client)
     // send valid xml with bogus fields — expect S3 to reject it
     log_info("bucket config: set bogus fields...");
 
-    reply = s3c_set_bucket_config(client, config_bucket, "lifecycle",
+    reply = s3c_set_bucket_config(client, TEST_BUCKET_CONFIG, "lifecycle",
                                    "<LifecycleConfiguration>"
                                    "<Rule>"
                                    "<BogusField>nonsense</BogusField>"
@@ -1111,8 +1061,6 @@ bool test_bucket_config(s3cClient* client)
 
 cleanup_and_ret:
     s3c_reply_free(reply);
-    s3cReply* del_reply = s3c_delete_bucket(client, config_bucket);
-    s3c_reply_free(del_reply);
 
     return all_good;
 }
@@ -1131,11 +1079,6 @@ bool test_list_objects(s3cClient* client)
     const char* payload = "x";
 
     log_info("list objects: setup...");
-
-    if (!create_test_bucket(client)) {
-        log_err("error: failed to create test bucket\n");
-        goto cleanup_and_ret;
-    }
 
     for (int i = 0; i < nkeys; i++) {
         reply = s3c_put_object(client, TEST_BUCKET, keys[i],
@@ -1348,8 +1291,6 @@ cleanup_and_ret:
         s3c_reply_free(del);
     }
 
-    delete_test_bucket(client);
-
     return all_good;
 }
 
@@ -1359,16 +1300,6 @@ bool run_basic_tests(s3cClient* client)
     s3cKVL* headers = NULL;
     char* filebuf = NULL;
     bool all_good = false;
-
-    log_info("create bucket...");
-
-    reply = s3c_create_bucket(client, TEST_BUCKET, NULL);
-
-    if (reply->error != NULL && reply->http_resp_code != 409) {
-        log_err("error: %s\n", reply->error);
-        goto cleanup_and_ret;
-    }
-    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
 
     const char* object_key = "test/file.bin";
     const char* rt_data = "test payload";
@@ -1698,9 +1629,13 @@ int main(int argc, const char** argv)
             if (argv[i][11] == '=' && argv[i][12] != '\0') {
                 idle_sleep_sec = atoi(&argv[i][12]);
             }
+        } else if (strncmp(argv[i], "--keys=", 7) == 0 && argv[i][7] != '\0') {
+            keys_file = &argv[i][7];
+            log_info("using keys file '%s'\n", keys_file);
         } else {
-            keys_file = argv[i];
-            log_info("using arg supplied keys file '%s'\n", keys_file);
+            log_err("unknown argument: %s\n", argv[i]);
+            log_err("usage: tests [--keys=<file>] [--test-idle[=seconds]]\n");
+            return 1;
         }
     }
 
@@ -1731,6 +1666,23 @@ int main(int argc, const char** argv)
         goto cleanup_and_ret;
     }
 
+    // create all test buckets
+    log_info("creating test buckets...");
+    {
+        const char* buckets[] = { TEST_BUCKET, TEST_BUCKET_CONFIG };
+        for (int i = 0; i < 2; i++) {
+            s3cReply* r = s3c_create_bucket(client, buckets[i], NULL);
+            if (r->error != NULL && r->http_resp_code != 409) {
+                log_err("error: failed to create bucket '%s': %s\n", buckets[i], r->error);
+                s3c_reply_free(r);
+                ret_code = 1;
+                goto cleanup_and_ret;
+            }
+            s3c_reply_free(r);
+        }
+    }
+    log_info("ok\n");
+
     ok = run_basic_tests(client);
     if (!ok) {
         ret_code = 1;
@@ -1755,6 +1707,17 @@ int main(int argc, const char** argv)
     if (!ok) {
         ret_code = 1;
     }
+
+    // delete all test buckets
+    log_info("deleting test buckets...");
+    {
+        const char* buckets[] = { TEST_BUCKET, TEST_BUCKET_CONFIG };
+        for (int i = 0; i < 2; i++) {
+            s3cReply* r = s3c_delete_bucket(client, buckets[i]);
+            s3c_reply_free(r);
+        }
+    }
+    log_info("ok\n");
 
 cleanup_and_ret:
     if (ret_code == 0) {

@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "s3c.h"
 
 #include <assert.h>
@@ -107,7 +108,7 @@ typedef struct {
 
 typedef struct {
     bool           ok;
-    bool           io_failed;
+    bool           should_retry;
     bool           can_reuse_conn;
     s3cClient*     client;
     s3cReply*      reply;
@@ -1760,11 +1761,12 @@ static void set_date_stamps(DateStamps* dates)
     time_t unix_now;
     time(&unix_now);
 
-    struct tm* cal_now = gmtime(&unix_now);
+    struct tm cal_now;
+    gmtime_r(&unix_now, &cal_now);
 
     size_t fmt_res = strftime(dates->date_time, S3C_DATE_TIME_STAMP_SIZE,
                               "%Y%m%dT%H%M%SZ",
-                              cal_now);
+                              &cal_now);
     assert(fmt_res == 16);
 
     memcpy(dates->date, dates->date_time, S3C_DATE_STAMP_SIZE - 1);
@@ -2422,7 +2424,7 @@ static void op_run_request(OpContext* op, const char* html_verb)
 
     op_send_request(op, html_verb, &request);
 
-    if (!op->ok && op->io_failed) {
+    if (!op->ok && op->should_retry) {
         // conection stale / transient net io error, reset state and try again
         const char* reset_err = op->args.stream_rd != NULL
             ? op->args.stream_rd->fn_reset(&op->args.stream_rd->ctx)
@@ -2439,7 +2441,7 @@ static void op_run_request(OpContext* op, const char* html_verb)
         s3c_reply_free(op->reply);
         op->reply = s3c_reply_alloc(NULL);
         op->ok = true;
-        op->io_failed = false;
+        op->should_retry = false;
 
         op_send_request(op, html_verb, &request);
     }
@@ -2520,6 +2522,11 @@ static void ossl_free(OsslContext* octx)
     free(octx);
 }
 
+static bool errno_is_timeout()
+{
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
 static const char* ossl_proc_io_res(OsslContext* octx, int io_res)
 {
     if (io_res == 1) {
@@ -2532,7 +2539,7 @@ static const char* ossl_proc_io_res(OsslContext* octx, int io_res)
         return NULL;
     }
 
-    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+    if (errno_is_timeout()) {
         return "net timeout";
     }
 
@@ -2541,7 +2548,7 @@ static const char* ossl_proc_io_res(OsslContext* octx, int io_res)
         return "connection was reset by peer";
     }
 
-    return  "unknown net error occured";
+    return "unknown net error occured";
 }
 
 static BIO* create_socket_bio(const char *host, const char *proto, uint64_t net_timeout_sec)
@@ -2782,7 +2789,7 @@ static bool op_ossl_io_read(OpContext* op,
     const char* err = ossl_proc_io_res(octx, io_res);
 
     if (err) {
-        op->io_failed = true;
+        op->should_retry = !errno_is_timeout();
         op_set_error_fmt(op, "failed to read http reply: %s", err);
         return false;
     }
@@ -2790,7 +2797,7 @@ static bool op_ossl_io_read(OpContext* op,
     if (*out_bytes_recv == 0 &&
         SSL_get_error(octx->ssl, 0) != SSL_ERROR_ZERO_RETURN) {
 
-        op->io_failed = true;
+        op->should_retry = true;
         op_set_error(op, "failed to read http reply: host hang up");
         return false;
     }
@@ -2815,13 +2822,13 @@ static bool op_ossl_io_write(OpContext* op, const char* data, size_t data_size)
     const char* err = ossl_proc_io_res(octx, io_res);
 
     if (err) {
-        op->io_failed = true;
+        op->should_retry = !errno_is_timeout();
         op_set_error_fmt(op, "failed to send http request: %s", err);
         return false;
     }
 
     if (bytes_sent < data_size) {
-        op->io_failed = true;
+        op->should_retry = true;
         op_set_error(op, "failed to send http request: SSL transmission error");
         return false;
     }
@@ -2994,15 +3001,30 @@ static void parse_chunked_body(OpContext* op,
             st->chunk_parse_pos = (size_t)(lbreak - recv_buf->ptr + 1);
 
             if (chunk_size == 0) {
-                const char* trailers = recv_buf->ptr + st->chunk_parse_pos;
-                char* trailers_end = strstr(trailers, "\r\n\r\n");
+                // after "0\r\n", expect either empty trailer "\r\n"
+                // or trailer headers ending with "\r\n\r\n"
+                size_t left = recv_buf->len - st->chunk_parse_pos;
 
-                if (trailers_end == NULL) {
+                if (left >= 2 &&
+                    recv_buf->ptr[st->chunk_parse_pos] == '\r' &&
+                    recv_buf->ptr[st->chunk_parse_pos + 1] == '\n') {
+                    // empty trailers — done
+                    st->chunk_parse_pos += 2;
+                    st->done = true;
                     break;
                 }
 
-                st->chunk_parse_pos = (size_t)(trailers_end - recv_buf->ptr + 4);
-                st->done = true;
+                // non-empty trailers: scan for "\r\n\r\n"
+                if (left >= 4) {
+                    const char* trailers = recv_buf->ptr + st->chunk_parse_pos;
+                    char* trailers_end = strstr(trailers, "\r\n\r\n");
+                    if (trailers_end != NULL) {
+                        st->chunk_parse_pos = (size_t)(trailers_end - recv_buf->ptr + 4);
+                        st->done = true;
+                        break;
+                    }
+                }
+
                 break;
             }
 
@@ -3184,16 +3206,14 @@ static void op_read_reply(OpContext* op, const char* html_verb)
         if (bytes_recv == 0) {
             if (!headers_parsed) {
                 // server closed connection, most probably becasue client idled too long
-                op->io_failed = true;
+                op->should_retry = true;
                 op_set_error(op, "failed to read http reply headers");
                 goto cleanup_and_ret;
             }
 
             if (body_mode == BODY_UNTIL_CLOSE || body_mode == BODY_NONE) {
                 body_done = true;
-                break;
             }
-
             op_set_error(op, "http reply ended before body was fully received");
             goto cleanup_and_ret;
         }
@@ -3223,6 +3243,8 @@ static void op_read_reply(OpContext* op, const char* html_verb)
 
             http_resp_code_ok = http_resp_code_is_ok(http_resp_code);
 
+            for (s3cKVL* h = op->reply->headers; h != NULL; h = h->next) {
+            }
             size_t body_start = (size_t)block_len + 4;
             size_t body_bytes = recv_buf.len - body_start;
 
@@ -3242,6 +3264,9 @@ static void op_read_reply(OpContext* op, const char* html_verb)
             );
             bool conn_close = header_has_token(
                 op->reply->headers, "connection", "close"
+            );
+            bool conn_keep_alive = header_has_token(
+                op->reply->headers, "connection", "keep-alive"
             );
 
             bool has_content_length = parse_reply_content_length(op->reply->headers,
@@ -3265,10 +3290,10 @@ static void op_read_reply(OpContext* op, const char* html_verb)
                     }
                 }
             } else {
-                body_mode = BODY_UNTIL_CLOSE;
             }
 
-            op->can_reuse_conn = !conn_close && body_mode != BODY_UNTIL_CLOSE;
+            op->can_reuse_conn = !conn_close && body_mode != BODY_UNTIL_CLOSE
+                                && (conn_keep_alive || has_content_length);
         }
     }
 
@@ -3291,7 +3316,6 @@ static const char* client_ensure_conn(s3cClient* client, const char* host)
             return "failed to allocate connection context";
         }
     }
-
     if (client->conn->ssl != NULL) {
 
         time_t idle_sec = time(NULL) - client->last_used;
@@ -3302,6 +3326,7 @@ static const char* client_ensure_conn(s3cClient* client, const char* host)
         } else {
             return NULL;
         }
+    } else {
     }
 
     const char* err = ossl_init(client->conn, client->ssl_ctx);
@@ -3324,7 +3349,7 @@ static void op_send_request(OpContext* op, const char* html_verb, StrBuf* rq_hea
 
     const char* conn_err = client_ensure_conn(op->client, endpoint.ptr);
     if (conn_err != NULL) {
-        op->io_failed = true;
+        op->should_retry = true;
         op_set_error(op, conn_err);
         goto cleanup_and_ret;
     }
