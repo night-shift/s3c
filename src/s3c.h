@@ -39,9 +39,21 @@ typedef struct {
     uint8_t       is_truncated; // boolean
 } s3cListResult;
 
+typedef struct s3cMpEntry {
+    char*    key;
+    char*    upload_id;
+    char*    initiated;
+    struct s3cMpEntry* next;
+} s3cMpEntry;
+
+typedef struct {
+    s3cMpEntry* entries;
+} s3cMpListResult;
+
 typedef enum {
     S3C_RESULT_RAW = 0,
     S3C_RESULT_LIST,
+    S3C_RESULT_UPLOADS,
 } s3cResultKind;
 
 typedef struct {
@@ -52,7 +64,8 @@ typedef struct {
     uint64_t http_resp_code;
     s3cResultKind result_kind;
     union {
-        s3cListResult list;
+        s3cListResult   list;
+        s3cMpListResult uploads;
     } result;
 } s3cReply;
 
@@ -170,6 +183,13 @@ s3cReply* s3c_multipart_abort(s3cMultipart* mp);
 
 void s3c_multipart_free(s3cMultipart* mp);
 
+s3cReply* s3c_list_multipart_uploads(s3cClient* client,
+                                      const char* bucket);
+
+s3cReply* s3c_abort_multipart_upload(s3cClient* client,
+                                      const char* bucket, const char* object_key,
+                                      const char* upload_id);
+
 
 void s3c_kvl_ins(s3cKVL** head_ref, const char* name, const char* value);
 
@@ -189,6 +209,8 @@ void s3c_reply_free(s3cReply*);
 void s3c_kvl_free(s3cKVL*);
 
 void s3c_list_entry_free(s3cListEntry*);
+
+void s3c_mp_entry_free(s3cMpEntry*);
 
 
 #ifdef __cplusplus

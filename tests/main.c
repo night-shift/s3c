@@ -1248,6 +1248,121 @@ cleanup_and_ret:
     return all_good;
 }
 
+bool test_list_abort_multipart(s3cClient* client)
+{
+    bool all_good = false;
+    s3cReply* reply = NULL;
+    s3cMultipart* mp = NULL;
+    char* found_upload_id = NULL;
+
+    const char* object_key = "mp-list-test/pending.bin";
+
+    // start a multipart upload but don't complete it
+    log_info("list/abort mp: init...");
+
+    reply = s3c_multipart_init(client, TEST_BUCKET, object_key, NULL, NULL, &mp);
+
+    if (reply->error != NULL) {
+        log_err("error: init: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    log_info("ok\n");
+
+    // list multipart uploads — our pending upload should appear
+    log_info("list/abort mp: list uploads...");
+
+    reply = s3c_list_multipart_uploads(client, TEST_BUCKET);
+
+    if (reply->error != NULL) {
+        log_err("error: list: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    if (reply->result_kind != S3C_RESULT_UPLOADS) {
+        log_err("error: expected result_kind UPLOADS, got %d\n", reply->result_kind);
+        goto cleanup_and_ret;
+    }
+
+    {
+        bool found = false;
+
+        for (s3cMpEntry* e = reply->result.uploads.entries; e != NULL; e = e->next) {
+            if (e->key != NULL && strcmp(e->key, object_key) == 0) {
+                found = true;
+                found_upload_id = strdup(e->upload_id);
+                break;
+            }
+        }
+
+        s3c_reply_free(reply);
+        reply = NULL;
+
+        if (!found || found_upload_id == NULL) {
+            log_err("error: pending upload not found in list\n");
+            goto cleanup_and_ret;
+        }
+
+        log_info("ok (found upload_id=%.40s...)\n", found_upload_id);
+
+        // abort via the public s3c_abort_multipart_upload
+        log_info("list/abort mp: abort upload...");
+
+        reply = s3c_abort_multipart_upload(client, TEST_BUCKET, object_key,
+                                            found_upload_id);
+
+        if (reply->error != NULL) {
+            log_err("error: abort: %s\n", reply->error);
+            goto cleanup_and_ret;
+        }
+    }
+
+    s3c_reply_free(reply);
+    reply = NULL;
+
+    log_info("ok\n");
+
+    // verify the specific upload no longer appears in the list
+    log_info("list/abort mp: verify cleanup...");
+
+    reply = s3c_list_multipart_uploads(client, TEST_BUCKET);
+
+    if (reply->error != NULL) {
+        log_err("error: list after abort: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    {
+        bool still_there = false;
+
+        for (s3cMpEntry* e = reply->result.uploads.entries; e != NULL; e = e->next) {
+            if (e->upload_id != NULL && strcmp(e->upload_id, found_upload_id) == 0) {
+                still_there = true;
+                break;
+            }
+        }
+
+        if (still_there) {
+            log_err("error: aborted upload still present in list\n");
+            goto cleanup_and_ret;
+        }
+    }
+
+    log_info("ok\n");
+
+    all_good = true;
+
+cleanup_and_ret:
+    free(found_upload_id);
+    s3c_reply_free(reply);
+    s3c_multipart_free(mp);
+
+    return all_good;
+}
+
 bool test_bucket_config(s3cClient* client)
 {
     bool all_good = false;
@@ -1985,6 +2100,11 @@ int main(int argc, const char** argv)
     }
 
     ok = test_multipart_api(client);
+    if (!ok) {
+        ret_code = 1;
+    }
+
+    ok = test_list_abort_multipart(client);
     if (!ok) {
         ret_code = 1;
     }

@@ -213,6 +213,18 @@ void s3c_list_entry_free(s3cListEntry* entry)
     }
 }
 
+void s3c_mp_entry_free(s3cMpEntry* entry)
+{
+    while (entry != NULL) {
+        s3cMpEntry* next = entry->next;
+        free(entry->key);
+        free(entry->upload_id);
+        free(entry->initiated);
+        free(entry);
+        entry = next;
+    }
+}
+
 static void s3c_reply_reset(s3cReply* reply)
 {
     if (reply == NULL) {
@@ -229,6 +241,10 @@ static void s3c_reply_reset(s3cReply* reply)
         case S3C_RESULT_LIST:
             s3c_list_entry_free(reply->result.list.entries);
             free(reply->result.list.continuation_token);
+            break;
+
+        case S3C_RESULT_UPLOADS:
+            s3c_mp_entry_free(reply->result.uploads.entries);
             break;
 
         default:
@@ -1760,6 +1776,103 @@ s3cReply* s3c_list_objects(s3cClient* client,
     }
 
     return reply;
+}
+
+static void parse_list_multipart_uploads_xml(const char* xml, s3cMpListResult* out)
+{
+    s3cMpEntry* tail = NULL;
+    const char* cursor = xml;
+    StrBuf field = str_init(128);
+    StrBuf block_buf = str_init(512);
+
+    while ((cursor = strstr(cursor, "<Upload>")) != NULL) {
+        const char* block_start = cursor + strlen("<Upload>");
+        const char* block_end = strstr(block_start, "</Upload>");
+
+        if (block_end == NULL) {
+            break;
+        }
+
+        size_t block_len = (size_t)(block_end - cursor) + strlen("</Upload>");
+        str_set(&block_buf, "");
+        str_push(&block_buf, cursor, block_len);
+
+        s3cMpEntry* entry = calloc(1, sizeof(s3cMpEntry));
+
+        parse_xml_tag(block_buf.ptr, "Key", &field);
+        entry->key = field.len > 0 ? str_dup(field.ptr) : NULL;
+
+        parse_xml_tag(block_buf.ptr, "UploadId", &field);
+        entry->upload_id = field.len > 0 ? str_dup(field.ptr) : NULL;
+
+        parse_xml_tag(block_buf.ptr, "Initiated", &field);
+        entry->initiated = field.len > 0 ? str_dup(field.ptr) : NULL;
+
+        if (tail == NULL) {
+            out->entries = entry;
+        } else {
+            tail->next = entry;
+        }
+        tail = entry;
+
+        cursor = block_end + strlen("</Upload>");
+    }
+
+    str_destroy(&field);
+    str_destroy(&block_buf);
+}
+
+s3cReply* s3c_list_multipart_uploads(s3cClient* client, const char* bucket)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_str(bucket, "bucket")) != NULL) {
+        return err;
+    }
+
+    s3cKVL query_args = {
+        .key = "uploads",
+        .value = "",
+    };
+
+    OpArgs args = {
+        .bucket = bucket,
+        .query_args = &query_args,
+    };
+
+    s3cReply* reply = run_s3_op(client, "GET", args);
+
+    if (reply->error == NULL && reply->data != NULL) {
+        reply->result_kind = S3C_RESULT_UPLOADS;
+        parse_list_multipart_uploads_xml((const char*)reply->data, &reply->result.uploads);
+    }
+
+    return reply;
+}
+
+s3cReply* s3c_abort_multipart_upload(s3cClient* client,
+                                      const char* bucket, const char* object_key,
+                                      const char* upload_id)
+{
+    s3cReply* err = NULL;
+
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
+        return err;
+    }
+
+    if ((err = check_arg_str(upload_id, "upload_id")) != NULL) {
+        return err;
+    }
+
+    return s3c_multipart_upload_abort(client, bucket, object_key, upload_id);
 }
 
 static void set_date_stamps(DateStamps* dates)
