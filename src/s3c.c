@@ -213,7 +213,7 @@ void s3c_list_entry_free(s3cListEntry* entry)
     }
 }
 
-void s3c_reply_free(s3cReply* reply)
+static void s3c_reply_reset(s3cReply* reply)
 {
     if (reply == NULL) {
         return;
@@ -235,6 +235,12 @@ void s3c_reply_free(s3cReply* reply)
             break;
     }
 
+    memset(reply, 0, sizeof(s3cReply));
+}
+
+void s3c_reply_free(s3cReply* reply)
+{
+    s3c_reply_reset(reply);
     free(reply);
 }
 
@@ -2438,8 +2444,7 @@ static void op_run_request(OpContext* op, const char* html_verb)
         }
 
 
-        s3c_reply_free(op->reply);
-        op->reply = s3c_reply_alloc(NULL);
+        s3c_reply_reset(op->reply);
         op->ok = true;
         op->should_retry = false;
 

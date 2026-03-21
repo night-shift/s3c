@@ -11,6 +11,7 @@
 #include <inttypes.h>
 #include <time.h>
 #include <unistd.h>
+#include <pthread.h>
 
 const char* TEST_BUCKET = "s3c-tests";
 const char* TEST_BUCKET_CONFIG = "s3c-tests-config";
@@ -525,6 +526,284 @@ bool test_api_argument_validation(void)
     return ok;
 }
 
+bool test_unreachable_endpoint(void)
+{
+    bool ok = true;
+
+    log_info("unreachable endpoint tests...\n");
+
+    s3cKeys keys = {
+        .access_key_id     = "test_key",
+        .access_key_secret = "test_secret",
+        .region            = "us-east-1",
+        .endpoint          = "https://bogus.invalid.endpoint.test",
+    };
+
+    s3cReply* err = NULL;
+    s3cClient* client = s3c_client_new(&keys, NULL, &err);
+
+    if (client == NULL) {
+        log_err("error: client_new failed for unreachable endpoint: %s\n",
+                err ? err->error : "unknown");
+        s3c_reply_free(err);
+        return false;
+    }
+
+    uint8_t data[] = "test";
+
+    ok = expect_error_reply("put_object unreachable",
+            s3c_put_object(client, "bucket", "key", data, sizeof(data), NULL),
+            NULL) && ok;
+
+    ok = expect_error_reply("get_object unreachable",
+            s3c_get_object(client, "bucket", "key"),
+            NULL) && ok;
+
+    ok = expect_error_reply("head_object unreachable",
+            s3c_head_object(client, "bucket", "key"),
+            NULL) && ok;
+
+    ok = expect_error_reply("list_objects unreachable",
+            s3c_list_objects(client, "bucket", NULL),
+            NULL) && ok;
+
+    ok = expect_error_reply("delete_object unreachable",
+            s3c_delete_object(client, "bucket", "key"),
+            NULL) && ok;
+
+    s3c_client_free(client);
+    return ok;
+}
+
+typedef struct {
+    s3cKeys  keys;
+    int      thread_id;
+    bool     ok;
+} ThreadTestArg;
+
+static void* thread_unreachable_worker(void* arg)
+{
+    ThreadTestArg* ta = arg;
+    ta->ok = true;
+
+    s3cReply* err = NULL;
+    s3cClient* client = s3c_client_new(&ta->keys, NULL, &err);
+
+    if (client == NULL) {
+        ta->ok = false;
+        s3c_reply_free(err);
+        return NULL;
+    }
+
+    uint8_t data[] = "test";
+
+    s3cReply* reply = s3c_put_object(client, "bucket", "key", data, sizeof(data), NULL);
+    if (reply == NULL || reply->error == NULL) {
+        ta->ok = false;
+    }
+    s3c_reply_free(reply);
+
+    reply = s3c_get_object(client, "bucket", "key");
+    if (reply == NULL || reply->error == NULL) {
+        ta->ok = false;
+    }
+    s3c_reply_free(reply);
+
+    reply = s3c_list_objects(client, "bucket", NULL);
+    if (reply == NULL || reply->error == NULL) {
+        ta->ok = false;
+    }
+    s3c_reply_free(reply);
+
+    s3c_client_free(client);
+    return NULL;
+}
+
+bool test_unreachable_endpoint_threaded(void)
+{
+    log_info("unreachable endpoint threaded (20 threads)...\n");
+
+    const int N = 20;
+    pthread_t threads[N];
+    ThreadTestArg args[N];
+
+    for (int i = 0; i < N; i++) {
+        args[i].keys = (s3cKeys){
+            .access_key_id     = "test_key",
+            .access_key_secret = "test_secret",
+            .region            = "us-east-1",
+            .endpoint          = "https://bogus.invalid.endpoint.test",
+        };
+        args[i].thread_id = i;
+        args[i].ok = false;
+
+        pthread_create(&threads[i], NULL, thread_unreachable_worker, &args[i]);
+    }
+
+    bool ok = true;
+    for (int i = 0; i < N; i++) {
+        pthread_join(threads[i], NULL);
+        if (!args[i].ok) {
+            log_err("error: thread %d failed\n", i);
+            ok = false;
+        }
+    }
+
+    return ok;
+}
+
+typedef struct {
+    s3cKeys* keys;
+    const char* bucket;
+    int thread_id;
+    bool ok;
+} ThreadRemoteArg;
+
+static void* thread_put_delete_worker(void* arg)
+{
+    ThreadRemoteArg* ta = arg;
+    ta->ok = false;
+
+    s3cReply* err = NULL;
+    s3cClient* client = s3c_client_new(ta->keys, NULL, &err);
+
+    if (client == NULL) {
+        s3c_reply_free(err);
+        return NULL;
+    }
+
+    char key[128];
+    snprintf(key, sizeof(key), "_s3c_test/thread_%d_%ld", ta->thread_id, (long)time(NULL));
+
+    uint8_t data[64];
+    memset(data, (uint8_t)ta->thread_id, sizeof(data));
+
+    s3cReply* reply = s3c_put_object(client, ta->bucket, key, data, sizeof(data), NULL);
+    if (reply->error != NULL) {
+        s3c_reply_free(reply);
+        s3c_client_free(client);
+        return NULL;
+    }
+    s3c_reply_free(reply);
+
+    reply = s3c_get_object(client, ta->bucket, key);
+    if (reply->error != NULL || reply->data_size != sizeof(data)) {
+        s3c_reply_free(reply);
+        s3c_client_free(client);
+        return NULL;
+    }
+    s3c_reply_free(reply);
+
+    reply = s3c_delete_object(client, ta->bucket, key);
+    if (reply->error != NULL) {
+        s3c_reply_free(reply);
+        s3c_client_free(client);
+        return NULL;
+    }
+    s3c_reply_free(reply);
+
+    s3c_client_free(client);
+    ta->ok = true;
+    return NULL;
+}
+
+bool test_threaded_put_delete(s3cKeys* keys)
+{
+    const int N = 20;
+
+    log_info("threaded put/get/delete (%d threads)...", N);
+
+    pthread_t threads[N];
+    ThreadRemoteArg args[N];
+
+    for (int i = 0; i < N; i++) {
+        args[i].keys = keys;
+        args[i].bucket = TEST_BUCKET;
+        args[i].thread_id = i;
+        args[i].ok = false;
+        pthread_create(&threads[i], NULL, thread_put_delete_worker, &args[i]);
+    }
+
+    bool ok = true;
+    for (int i = 0; i < N; i++) {
+        pthread_join(threads[i], NULL);
+        if (!args[i].ok) {
+            log_err("error: thread %d failed\n", i);
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        log_info("ok\n");
+    }
+
+    return ok;
+}
+
+static void* thread_put_nonexistent_worker(void* arg)
+{
+    ThreadRemoteArg* ta = arg;
+    ta->ok = false;
+
+    s3cReply* err = NULL;
+    s3cClient* client = s3c_client_new(ta->keys, NULL, &err);
+
+    if (client == NULL) {
+        s3c_reply_free(err);
+        return NULL;
+    }
+
+    uint8_t data[] = "fail";
+
+    s3cReply* reply = s3c_put_object(client, "nonexistent-bucket-s3c-test-999",
+                                      "key", data, sizeof(data), NULL);
+    if (reply == NULL) {
+        s3c_client_free(client);
+        return NULL;
+    }
+
+    if (reply->error != NULL) {
+        ta->ok = true;  // expected to fail
+    }
+
+    s3c_reply_free(reply);
+    s3c_client_free(client);
+    return NULL;
+}
+
+bool test_threaded_put_nonexistent_bucket(s3cKeys* keys)
+{
+    const int N = 20;
+
+    log_info("threaded put nonexistent bucket (%d threads)...", N);
+
+    pthread_t threads[N];
+    ThreadRemoteArg args[N];
+
+    for (int i = 0; i < N; i++) {
+        args[i].keys = keys;
+        args[i].bucket = NULL;
+        args[i].thread_id = i;
+        args[i].ok = false;
+        pthread_create(&threads[i], NULL, thread_put_nonexistent_worker, &args[i]);
+    }
+
+    bool ok = true;
+    for (int i = 0; i < N; i++) {
+        pthread_join(threads[i], NULL);
+        if (!args[i].ok) {
+            log_err("error: thread %d did not get expected error\n", i);
+            ok = false;
+        }
+    }
+
+    if (ok) {
+        log_info("ok\n");
+    }
+
+    return ok;
+}
+
 bool run_local_tests(void)
 {
     bool ok = true;
@@ -535,6 +814,8 @@ bool run_local_tests(void)
     ok = test_kvl_helpers() && ok;
     ok = test_client_constructor_validation() && ok;
     ok = test_api_argument_validation() && ok;
+    ok = test_unreachable_endpoint() && ok;
+    ok = test_unreachable_endpoint_threaded() && ok;
 
     if (ok) {
         log_info("local validation tests passed\n");
@@ -1684,6 +1965,16 @@ int main(int argc, const char** argv)
     log_info("ok\n");
 
     ok = run_basic_tests(client);
+    if (!ok) {
+        ret_code = 1;
+    }
+
+    ok = test_threaded_put_delete(&keys);
+    if (!ok) {
+        ret_code = 1;
+    }
+
+    ok = test_threaded_put_nonexistent_bucket(&keys);
     if (!ok) {
         ret_code = 1;
     }
