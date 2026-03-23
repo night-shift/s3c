@@ -1282,7 +1282,7 @@ bool test_list_abort_multipart(s3cClient* client)
         goto cleanup_and_ret;
     }
 
-    if (reply->result_kind != S3C_RESULT_UPLOADS) {
+    if (reply->result_kind != S3C_RESULT_LIST_MP_UPLOADS) {
         log_err("error: expected result_kind UPLOADS, got %d\n", reply->result_kind);
         goto cleanup_and_ret;
     }
@@ -1290,7 +1290,7 @@ bool test_list_abort_multipart(s3cClient* client)
     {
         bool found = false;
 
-        for (s3cMpEntry* e = reply->result.uploads.entries; e != NULL; e = e->next) {
+        for (s3cMpEntry* e = reply->result.list_mp_uploads.entries; e != NULL; e = e->next) {
             if (e->key != NULL && strcmp(e->key, object_key) == 0) {
                 found = true;
                 found_upload_id = strdup(e->upload_id);
@@ -1308,10 +1308,10 @@ bool test_list_abort_multipart(s3cClient* client)
 
         log_info("ok (found upload_id=%.40s...)\n", found_upload_id);
 
-        // abort via the public s3c_abort_multipart_upload
+        // abort via the public s3c_delete_multipart_upload
         log_info("list/abort mp: abort upload...");
 
-        reply = s3c_abort_multipart_upload(client, TEST_BUCKET, object_key,
+        reply = s3c_delete_multipart_upload(client, TEST_BUCKET, object_key,
                                             found_upload_id);
 
         if (reply->error != NULL) {
@@ -1338,7 +1338,7 @@ bool test_list_abort_multipart(s3cClient* client)
     {
         bool still_there = false;
 
-        for (s3cMpEntry* e = reply->result.uploads.entries; e != NULL; e = e->next) {
+        for (s3cMpEntry* e = reply->result.list_mp_uploads.entries; e != NULL; e = e->next) {
             if (e->upload_id != NULL && strcmp(e->upload_id, found_upload_id) == 0) {
                 still_there = true;
                 break;
@@ -1502,7 +1502,7 @@ bool test_list_objects(s3cClient* client)
 
     for (int i = 0; i < nkeys; i++) {
         bool found = false;
-        for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+        for (s3cListEntry* e = reply->result.list_objects.entries; e != NULL; e = e->next) {
             if (strcmp(e->key, keys[i]) == 0) {
                 found = true;
                 break;
@@ -1530,7 +1530,7 @@ bool test_list_objects(s3cClient* client)
 
     for (int i = 0; i < nkeys; i++) {
         bool found = false;
-        for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+        for (s3cListEntry* e = reply->result.list_objects.entries; e != NULL; e = e->next) {
             if (strcmp(e->key, keys[i]) == 0) {
                 found = true;
                 break;
@@ -1556,7 +1556,7 @@ bool test_list_objects(s3cClient* client)
         goto cleanup_and_ret;
     }
 
-    if (reply->result.list.entries == NULL) {
+    if (reply->result.list_objects.entries == NULL) {
         log_err("error: max_keys=0 should use S3 default, got no entries\n");
         goto cleanup_and_ret;
     }
@@ -1575,7 +1575,7 @@ bool test_list_objects(s3cClient* client)
         goto cleanup_and_ret;
     }
 
-    s3cListEntry* entries = reply->result.list.entries;
+    s3cListEntry* entries = reply->result.list_objects.entries;
 
     if (entries == NULL) {
         log_err("error: expected at least one entry with max_keys=1\n");
@@ -1591,7 +1591,7 @@ bool test_list_objects(s3cClient* client)
 
     log_info("list objects: continuation token...");
 
-    if (!reply->result.list.is_truncated || reply->result.list.continuation_token == NULL) {
+    if (!reply->result.list_objects.is_truncated || reply->result.list_objects.continuation_token == NULL) {
         log_err("error: expected truncated response with continuation token\n");
         goto cleanup_and_ret;
     }
@@ -1600,7 +1600,7 @@ bool test_list_objects(s3cClient* client)
 
     s3cListObjectsOpts cont_opts = {
         .max_keys = 1,
-        .continuation_token = reply->result.list.continuation_token,
+        .continuation_token = reply->result.list_objects.continuation_token,
     };
 
     s3cReply* cont_reply = s3c_list_objects(client, TEST_BUCKET, &cont_opts);
@@ -1611,7 +1611,7 @@ bool test_list_objects(s3cClient* client)
         goto cleanup_and_ret;
     }
 
-    s3cListEntry* cont_entries = cont_reply->result.list.entries;
+    s3cListEntry* cont_entries = cont_reply->result.list_objects.entries;
 
     if (cont_entries == NULL) {
         log_err("error: no entries in continuation page\n");
@@ -1652,7 +1652,7 @@ bool test_list_objects(s3cClient* client)
     }
 
     int entry_count = 0;
-    for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+    for (s3cListEntry* e = reply->result.list_objects.entries; e != NULL; e = e->next) {
         entry_count++;
     }
 
@@ -1663,7 +1663,7 @@ bool test_list_objects(s3cClient* client)
 
     for (int i = 0; i < nkeys; i++) {
         bool found = false;
-        for (s3cListEntry* e = reply->result.list.entries; e != NULL; e = e->next) {
+        for (s3cListEntry* e = reply->result.list_objects.entries; e != NULL; e = e->next) {
             if (strcmp(e->key, keys[i]) == 0) {
                 found = true;
                 break;

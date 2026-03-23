@@ -52,8 +52,8 @@ typedef struct {
 
 typedef enum {
     S3C_RESULT_RAW = 0,
-    S3C_RESULT_LIST,
-    S3C_RESULT_UPLOADS,
+    S3C_RESULT_LIST_OBJECTS,
+    S3C_RESULT_LIST_MP_UPLOADS,
 } s3cResultKind;
 
 typedef struct {
@@ -64,8 +64,8 @@ typedef struct {
     uint64_t http_resp_code;
     s3cResultKind result_kind;
     union {
-        s3cListResult   list;
-        s3cMpListResult uploads;
+        s3cListResult   list_objects;
+        s3cMpListResult list_mp_uploads;
     } result;
 } s3cReply;
 
@@ -161,6 +161,7 @@ typedef struct {
     uint8_t     fetch_all; // boolean
 } s3cListObjectsOpts;
 
+// returns result kind S3C_RESULT_LIST_OBJECTS with reply->list being s3cListResult
 s3cReply* s3c_list_objects(s3cClient* client,
                            const char* bucket,
                            const s3cListObjectsOpts* opts);
@@ -183,10 +184,11 @@ s3cReply* s3c_multipart_abort(s3cMultipart* mp);
 
 void s3c_multipart_free(s3cMultipart* mp);
 
+// returns result kind S3C_RESULT_LIST_MP_UPLOADS with reply->uploads being s3cMpListResult
 s3cReply* s3c_list_multipart_uploads(s3cClient* client,
-                                      const char* bucket);
+                                     const char* bucket);
 
-s3cReply* s3c_abort_multipart_upload(s3cClient* client,
+s3cReply* s3c_delete_multipart_upload(s3cClient* client,
                                       const char* bucket, const char* object_key,
                                       const char* upload_id);
 

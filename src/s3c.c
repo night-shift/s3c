@@ -238,13 +238,13 @@ static void s3c_reply_reset(s3cReply* reply)
 
     switch (reply->result_kind) {
 
-        case S3C_RESULT_LIST:
-            s3c_list_entry_free(reply->result.list.entries);
-            free(reply->result.list.continuation_token);
+        case S3C_RESULT_LIST_OBJECTS:
+            s3c_list_entry_free(reply->result.list_objects.entries);
+            free(reply->result.list_objects.continuation_token);
             break;
 
-        case S3C_RESULT_UPLOADS:
-            s3c_mp_entry_free(reply->result.uploads.entries);
+        case S3C_RESULT_LIST_MP_UPLOADS:
+            s3c_mp_entry_free(reply->result.list_mp_uploads.entries);
             break;
 
         default:
@@ -427,6 +427,15 @@ void s3c_client_free(s3cClient* client)
 
     SSL_CTX_free(client->ssl_ctx);
     free(client);
+}
+
+static s3cReply* check_arg_client(s3cClient* client)
+{
+    if (client == NULL) {
+        return s3c_reply_alloc("provided arguments missing value for <client>");
+    }
+
+    return NULL;
 }
 
 static s3cReply* check_arg_str(const char* arg, const char* arg_name)
@@ -652,8 +661,8 @@ s3cReply* s3c_get_object(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -687,8 +696,8 @@ s3cReply* s3c_get_object_to_file(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -759,8 +768,8 @@ s3cReply* s3c_get_object_stream(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -809,8 +818,8 @@ s3cReply* s3c_put_object(s3cClient* client,
 {
     s3cReply* err = check_arg_bucket_key(bucket, object_key);
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if (err != NULL) {
@@ -874,9 +883,9 @@ cleanup_and_ret:
     str_destroy(&tag_str);
 }
 
-static s3cReply* s3c_multipart_upload_abort(s3cClient* client,
-                                            const char* bucket, const char* obj_key,
-                                            const char* upload_id)
+static s3cReply* delete_multipart_upload(s3cClient* client,
+                                         const char* bucket, const char* obj_key,
+                                         const char* upload_id)
 {
     s3cKVL query_args = {
         .key = "uploadId",
@@ -892,10 +901,10 @@ static s3cReply* s3c_multipart_upload_abort(s3cClient* client,
     return run_s3_op(client, "DELETE", args);
 }
 
-static s3cReply* s3c_multipart_upload_init(s3cClient* client,
-                                           const char* bucket, const char* object_key,
-                                           const s3cKVL* headers,
-                                           StrBuf* out_upload_id)
+static s3cReply* multipart_upload_init(s3cClient* client,
+                                       const char* bucket, const char* object_key,
+                                       const s3cKVL* headers,
+                                       StrBuf* out_upload_id)
 {
     s3cKVL query_args = {
         .key = "uploads",
@@ -1036,8 +1045,8 @@ s3cReply* s3c_multipart_init(s3cClient* client,
     *out = NULL;
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -1046,7 +1055,7 @@ s3cReply* s3c_multipart_init(s3cClient* client,
 
     StrBuf upload_id = str_init(128);
 
-    s3cReply* reply = s3c_multipart_upload_init(
+    s3cReply* reply = multipart_upload_init(
         client, bucket, object_key, headers, &upload_id
     );
 
@@ -1236,20 +1245,20 @@ s3cReply* s3c_multipart_abort(s3cMultipart* mp)
         return s3c_reply_alloc("provided arguments missing value for <multipart>");
     }
 
-    return s3c_multipart_upload_abort(
+    return delete_multipart_upload(
         mp->client, mp->bucket, mp->object_key,
         mp->upload_id
     );
 }
 
 s3cReply* s3c_put_object_from_file(s3cClient* client,
-                                      const char* bucket, const char* object_key,
-                                      const char* file, const s3cKVL* headers)
+                                   const char* bucket, const char* object_key,
+                                   const char* file, const s3cKVL* headers)
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     err = check_arg_bucket_key(bucket, object_key);
@@ -1315,8 +1324,8 @@ s3cReply* s3c_put_object_from_file_multipart(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -1374,12 +1383,12 @@ cleanup_and_ret:
 }
 
 s3cReply* s3c_head_object(s3cClient* client,
-                             const char* bucket, const char* object_key)
+                         const char* bucket, const char* object_key)
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -1400,8 +1409,8 @@ s3cReply* s3c_copy_object(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_str(src_bucket, "src_bucket")) != NULL) {
@@ -1442,8 +1451,8 @@ s3cReply* s3c_delete_object(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -1463,8 +1472,8 @@ s3cReply* s3c_create_bucket(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
@@ -1498,8 +1507,8 @@ s3cReply* s3c_delete_bucket(s3cClient* client, const char* bucket)
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
@@ -1519,8 +1528,8 @@ s3cReply* s3c_get_bucket_config(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
@@ -1564,8 +1573,8 @@ s3cReply* s3c_set_bucket_config(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
@@ -1677,9 +1686,7 @@ static s3cReply* list_objects_page(s3cClient* client,
     s3c_kvl_ins(&query_args, "list-type", "2");
 
     if (opts != NULL && opts->max_keys > 0) {
-        char max_keys_str[21];
-        snprintf(max_keys_str, sizeof(max_keys_str), "%" PRIu64, opts->max_keys);
-        s3c_kvl_ins(&query_args, "max-keys", max_keys_str);
+        s3c_kvl_ins_int(&query_args, "max-keys", opts->max_keys);
     }
 
     if (opts != NULL && opts->prefix != NULL && *opts->prefix != '\0') {
@@ -1702,8 +1709,8 @@ static s3cReply* list_objects_page(s3cClient* client,
     s3cReply* reply = run_s3_op(client, "GET", args);
 
     if (reply->error == NULL) {
-        reply->result_kind = S3C_RESULT_LIST;
-        parse_list_objects_xml(res_buf.ptr, &reply->result.list);
+        reply->result_kind = S3C_RESULT_LIST_OBJECTS;
+        parse_list_objects_xml(res_buf.ptr, &reply->result.list_objects);
     }
 
     str_destroy(&res_buf);
@@ -1718,8 +1725,8 @@ s3cReply* s3c_list_objects(s3cClient* client,
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
@@ -1732,47 +1739,54 @@ s3cReply* s3c_list_objects(s3cClient* client,
         return reply;
     }
 
+    assert (reply->result_kind == S3C_RESULT_LIST_OBJECTS);
+
+    s3cListResult* list_res = &reply->result.list_objects;
+
     // auto-paginate: append entries from subsequent pages
-    s3cListEntry* tail = reply->result.list.entries;
+    s3cListEntry* tail = list_res->entries;
     while (tail != NULL && tail->next != NULL) {
         tail = tail->next;
     }
 
-    while (reply->result.list.is_truncated &&
-           reply->result.list.continuation_token != NULL) {
+    while (list_res->is_truncated &&
+           list_res->continuation_token != NULL) {
 
-        s3cReply* page = list_objects_page(
+        s3cReply* page_rep = list_objects_page(
             client, bucket, opts,
-            reply->result.list.continuation_token
+            list_res->continuation_token
         );
 
-        if (page->error != NULL) {
+        if (page_rep->error != NULL) {
             // return the error page, discard accumulated results
             s3c_reply_free(reply);
-            return page;
+            return page_rep;
         }
 
+        s3cListResult* page_res = &page_rep->result.list_objects;
+
         // steal entries from page and append to reply
-        if (page->result.list.entries != NULL) {
+        if (page_res->entries != NULL) {
             if (tail == NULL) {
-                reply->result.list.entries = page->result.list.entries;
+                list_res->entries = page_res->entries;
             } else {
-                tail->next = page->result.list.entries;
+                tail->next = page_res->entries;
             }
             // advance tail to end of new entries
             while (tail != NULL && tail->next != NULL) {
                 tail = tail->next;
             }
-            page->result.list.entries = NULL;
+            page_res->entries = NULL;
         }
 
         // update continuation state from latest page
-        free(reply->result.list.continuation_token);
-        reply->result.list.continuation_token = page->result.list.continuation_token;
-        reply->result.list.is_truncated = page->result.list.is_truncated;
-        page->result.list.continuation_token = NULL;
+        free(list_res->continuation_token);
 
-        s3c_reply_free(page);
+        list_res->continuation_token = page_res->continuation_token;
+        list_res->is_truncated = page_res->is_truncated;
+        page_res->continuation_token = NULL;
+
+        s3c_reply_free(page_rep);
     }
 
     return reply;
@@ -1826,8 +1840,8 @@ s3cReply* s3c_list_multipart_uploads(s3cClient* client, const char* bucket)
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_str(bucket, "bucket")) != NULL) {
@@ -1847,21 +1861,21 @@ s3cReply* s3c_list_multipart_uploads(s3cClient* client, const char* bucket)
     s3cReply* reply = run_s3_op(client, "GET", args);
 
     if (reply->error == NULL && reply->data != NULL) {
-        reply->result_kind = S3C_RESULT_UPLOADS;
-        parse_list_multipart_uploads_xml((const char*)reply->data, &reply->result.uploads);
+        reply->result_kind = S3C_RESULT_LIST_MP_UPLOADS;
+        parse_list_multipart_uploads_xml((const char*)reply->data, &reply->result.list_mp_uploads);
     }
 
     return reply;
 }
 
-s3cReply* s3c_abort_multipart_upload(s3cClient* client,
+s3cReply* s3c_delete_multipart_upload(s3cClient* client,
                                       const char* bucket, const char* object_key,
                                       const char* upload_id)
 {
     s3cReply* err = NULL;
 
-    if (client == NULL) {
-        return s3c_reply_alloc("provided arguments missing value for <client>");
+    if ((err = check_arg_client(client)) != NULL) {
+        return err;
     }
 
     if ((err = check_arg_bucket_key(bucket, object_key)) != NULL) {
@@ -1872,7 +1886,7 @@ s3cReply* s3c_abort_multipart_upload(s3cClient* client,
         return err;
     }
 
-    return s3c_multipart_upload_abort(client, bucket, object_key, upload_id);
+    return delete_multipart_upload(client, bucket, object_key, upload_id);
 }
 
 static void set_date_stamps(DateStamps* dates)
@@ -1917,11 +1931,6 @@ static void op_context_init(OpContext* op, OpArgs args, s3cClient* client, s3cRe
     op->reply = reply;
     op->client = client;
     op->args = args;
-
-    if (client == NULL) {
-        op_set_error(op, "provided arguments missing value for <client>");
-        return;
-    }
 
     if (client->keys.access_key_id == NULL ||
         strlen(client->keys.access_key_id) < 1) {
@@ -2343,14 +2352,14 @@ s3cReply* s3c_generate_presigned_url(s3cClient* client,
     StrBuf encoded_cred = str_init(128);
     append_uri_query_value(&encoded_cred, credential.ptr);
 
-    char expires_str[21];
-    snprintf(expires_str, sizeof(expires_str), "%" PRIu64, expires_sec);
+    StrBuf expires_str = str_init(20);
+    str_push_int(&expires_str, expires_sec);
 
     str_push_many(&query_str,
         "X-Amz-Algorithm=", S3_SIGNATURE_ALGO,
         "&X-Amz-Credential=", encoded_cred.ptr,
         "&X-Amz-Date=", dates.date_time,
-        "&X-Amz-Expires=", expires_str,
+        "&X-Amz-Expires=", expires_str.ptr,
         "&X-Amz-SignedHeaders=host",
         NULL
     );
@@ -2413,21 +2422,21 @@ cleanup_and_ret:
     str_destroy(&sts);
     str_destroy(&credential);
     str_destroy(&encoded_cred);
+    str_destroy(&expires_str);
 
     return reply;
 }
 
 static void op_run_request(OpContext* op, const char* html_verb)
 {
-    uint64_t max_cap_reserve_mb = op->client->confs.str_buf_max_cap_reserve_mb;
-    StrBuf request = str_init_conf(128, max_cap_reserve_mb),
-           request_sig = str_init_conf(128, max_cap_reserve_mb),
-           sig_headers = str_init_conf(128, max_cap_reserve_mb),
-           sig_header_names = str_init_conf(128, max_cap_reserve_mb),
-           auth_header = str_init_conf(128, max_cap_reserve_mb),
-           sig_url = str_init_conf(128, max_cap_reserve_mb),
-           req_url = str_init_conf(128, max_cap_reserve_mb),
-           query_str = str_init_conf(128, max_cap_reserve_mb),
+    StrBuf request = str_init(128),
+           request_sig = str_init(128),
+           sig_headers = str_init(128),
+           sig_header_names = str_init(128),
+           auth_header = str_init(128),
+           sig_url = str_init(128),
+           req_url = str_init(128),
+           query_str = str_init(128),
            endpoint = get_req_host(op->client);
 
     s3cKVL* headers = NULL;
@@ -3323,7 +3332,7 @@ static void op_read_reply(OpContext* op, const char* html_verb)
 
         if (bytes_recv == 0) {
             if (!headers_parsed) {
-                // server closed connection, most probably becasue client idled too long
+                // server closed connection, most probably because client idled too long
                 op->should_retry = true;
                 op_set_error(op, "failed to read http reply headers");
                 goto cleanup_and_ret;
