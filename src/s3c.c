@@ -43,20 +43,17 @@ static const char* S3_HTTP_VERSION      = "HTTP/1.1";
 #define S3C_DEF_NET_IO_TIMEOUT_SEC          15U
 #define S3C_DEF_MAX_REPLY_PREALLOC_SIZE_MB 128U
 #define S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB  10U
-#define S3C_DEF_CLIENT_IDLE_SEC_MAX         300
 
 typedef struct {
     uint64_t net_io_timeout_sec;
     uint64_t max_reply_prealloc_size_mb;
     uint64_t str_buf_max_cap_reserve_mb;
-    uint64_t client_idle_sec_max;
 } RuntimeConfs;
 
 static RuntimeConfs S3C_DEFAULT_CONFS = {
     .net_io_timeout_sec = S3C_DEF_NET_IO_TIMEOUT_SEC,
     .max_reply_prealloc_size_mb = S3C_DEF_MAX_REPLY_PREALLOC_SIZE_MB,
     .str_buf_max_cap_reserve_mb = S3C_DEF_STR_BUF_MAX_CAP_RESERVE_MB,
-    .client_idle_sec_max = S3C_DEF_CLIENT_IDLE_SEC_MAX
 };
 
 typedef struct {
@@ -68,7 +65,6 @@ struct s3cClient {
     RuntimeConfs confs;
     SSL_CTX* ssl_ctx;
     OsslContext* conn;
-    time_t last_used;
 };
 
 static const char* ossl_ctx_init(SSL_CTX** out_ctx);
@@ -109,7 +105,6 @@ typedef struct {
 typedef struct {
     bool           ok;
     bool           should_retry;
-    bool           can_reuse_conn;
     s3cClient*     client;
     s3cReply*      reply;
     OpArgs         args;
@@ -169,9 +164,6 @@ uint64_t s3c_set_global_config(uint64_t opt, uint64_t value)
             S3C_DEFAULT_CONFS.max_reply_prealloc_size_mb = value;
             return 1;
 
-        case S3C_CONF_CLIENT_IDLE_SEC_MAX:
-            S3C_DEFAULT_CONFS.client_idle_sec_max = value;
-            return 1;
     }
 
     return 0;
@@ -2527,11 +2519,7 @@ static void op_run_request(OpContext* op, const char* html_verb)
     }
 
     s3c_kvl_upsert(&headers, "authorization", auth_header.ptr);
-    if (op->client->confs.client_idle_sec_max > 0) {
-        s3c_kvl_upsert(&headers, "connection", "keep-alive");
-    } else {
-        s3c_kvl_upsert(&headers, "connection", "close");
-    }
+    s3c_kvl_upsert(&headers, "connection", "close");
 
     // build http request head
     str_push_many(
@@ -3238,8 +3226,6 @@ static void op_read_reply(OpContext* op, const char* html_verb)
         .done = false,
     };
 
-    op->can_reuse_conn = false;
-
     for (;;) {
         if (headers_parsed) {
             const char* proc_err = NULL;
@@ -3390,13 +3376,6 @@ static void op_read_reply(OpContext* op, const char* html_verb)
             bool is_chunked = header_has_token(
                 op->reply->headers, "transfer-encoding", "chunked"
             );
-            bool conn_close = header_has_token(
-                op->reply->headers, "connection", "close"
-            );
-            bool conn_keep_alive = header_has_token(
-                op->reply->headers, "connection", "keep-alive"
-            );
-
             bool has_content_length = parse_reply_content_length(op->reply->headers,
                                                                  &content_length);
 
@@ -3420,22 +3399,16 @@ static void op_read_reply(OpContext* op, const char* html_verb)
             } else {
                 body_mode = BODY_UNTIL_CLOSE;
             }
-
-            op->can_reuse_conn = !conn_close && body_mode != BODY_UNTIL_CLOSE
-                                && (conn_keep_alive || has_content_length);
         }
     }
 
     op_proc_reply(op, &body_buf, http_resp_code);
 
 cleanup_and_ret:
-    if (!op->ok) {
-        op->can_reuse_conn = false;
-    }
-
     str_destroy(&recv_buf);
     str_destroy(&body_buf);
 }
+
 
 static const char* client_ensure_conn(s3cClient* client, const char* host)
 {
@@ -3445,17 +3418,9 @@ static const char* client_ensure_conn(s3cClient* client, const char* host)
             return "failed to allocate connection context";
         }
     }
+
     if (client->conn->ssl != NULL) {
-
-        time_t idle_sec = time(NULL) - client->last_used;
-
-        if (client->last_used > 0 && idle_sec >= (time_t)client->confs.client_idle_sec_max) {
-            ossl_disconnect(client->conn);
-
-        } else {
-            return NULL;
-        }
-    } else {
+        ossl_disconnect(client->conn);
     }
 
     const char* err = ossl_init(client->conn, client->ssl_ctx);
@@ -3517,12 +3482,7 @@ static void op_send_request(OpContext* op, const char* html_verb, StrBuf* rq_hea
     op_read_reply(op, html_verb);
 
 cleanup_and_ret:
-    if (!op->ok || !op->can_reuse_conn) {
-        ossl_disconnect(op->client->conn);
-    } else {
-        op->client->last_used = time(NULL);
-    }
-
+    ossl_disconnect(op->client->conn);
     str_destroy(&endpoint);
 }
 
