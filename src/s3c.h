@@ -76,6 +76,8 @@ typedef struct {
     uint64_t str_buf_max_cap_reserve_mb;
 } s3cClientOpts;
 
+void s3c_ensure_openssl_init(void);
+
 s3cClient* s3c_client_new(const s3cKeys* keys,
                           const s3cClientOpts* opts,
                           s3cReply** out_err);
@@ -128,7 +130,8 @@ s3cReply* s3c_head_object(s3cClient* client,
 
 s3cReply* s3c_copy_object(s3cClient* client,
                           const char* src_bucket, const char* src_key,
-                          const char* dst_bucket, const char* dst_key);
+                          const char* dst_bucket, const char* dst_key,
+                          const s3cKVL* headers);
 
 s3cReply* s3c_generate_presigned_url(s3cClient* client,
                                      const char* bucket, const char* object_key,

@@ -127,6 +127,8 @@ typedef struct {
     char date      [S3C_DATE_STAMP_SIZE];
 } DateStamps;
 
+static int s3c_openssl_initialized = 0;
+
 static void op_context_init(OpContext*, OpArgs args, s3cClient*,  s3cReply*);
 static void op_context_free(OpContext*);
 static void op_run_request(OpContext* op, const char* html_verb);
@@ -152,6 +154,16 @@ static char*  str_extract(StrBuf*);
 static void s3c_kvl_upsert(s3cKVL** head, const char* name, const char* value);
 static void set_runtime_confs(RuntimeConfs* out, const s3cClientOpts* opts);
 static char* normalize_endpoint_host(const char* endpoint);
+
+
+void s3c_ensure_openssl_init(void)
+{
+    if (s3c_openssl_initialized) {
+        return;
+    }
+    OPENSSL_init_ssl(OPENSSL_INIT_LOAD_SSL_STRINGS | OPENSSL_INIT_LOAD_CRYPTO_STRINGS, NULL);
+    s3c_openssl_initialized = 1;
+}
 
 uint64_t s3c_set_global_config(uint64_t opt, uint64_t value)
 {
@@ -314,6 +326,8 @@ s3cClient* s3c_client_new(const s3cKeys* keys,
                           const s3cClientOpts* opts,
                           s3cReply** out_err)
 {
+    s3c_ensure_openssl_init();
+
     if (out_err != NULL) {
         *out_err = NULL;
     }
@@ -1397,7 +1411,8 @@ s3cReply* s3c_head_object(s3cClient* client,
 
 s3cReply* s3c_copy_object(s3cClient* client,
                           const char* src_bucket, const char* src_key,
-                          const char* dst_bucket, const char* dst_key)
+                          const char* dst_bucket, const char* dst_key,
+                          const s3cKVL* headers)
 {
     s3cReply* err = NULL;
 
@@ -1420,9 +1435,16 @@ s3cReply* s3c_copy_object(s3cClient* client,
     StrBuf copy_source = str_init(strlen(src_bucket) + strlen(src_key) + 2);
     str_push_many(&copy_source, "/", src_bucket, "/", src_key, NULL);
 
+    s3cKVL metadata_directive = {
+        .key = "x-amz-metadata-directive",
+        .value = "REPLACE",
+        .next = (s3cKVL*)headers,
+    };
+
     s3cKVL copy_header = {
         .key = "x-amz-copy-source",
         .value = copy_source.ptr,
+        .next = headers ? &metadata_directive : NULL,
     };
 
     OpArgs args = {

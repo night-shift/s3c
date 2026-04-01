@@ -454,15 +454,15 @@ bool test_api_argument_validation(void)
             s3c_head_object(client, "b", NULL), "<object_key>") && ok;
 
     ok = expect_error_reply("copy_object null client",
-            s3c_copy_object(NULL, "b", "k", "b", "k"), "<client>") && ok;
+            s3c_copy_object(NULL, "b", "k", "b", "k", NULL), "<client>") && ok;
     ok = expect_error_reply("copy_object null src_bucket",
-            s3c_copy_object(client, NULL, "k", "b", "k"), "<src_bucket>") && ok;
+            s3c_copy_object(client, NULL, "k", "b", "k", NULL), "<src_bucket>") && ok;
     ok = expect_error_reply("copy_object null src_key",
-            s3c_copy_object(client, "b", NULL, "b", "k"), "<src_key>") && ok;
+            s3c_copy_object(client, "b", NULL, "b", "k", NULL), "<src_key>") && ok;
     ok = expect_error_reply("copy_object null dst_bucket",
-            s3c_copy_object(client, "b", "k", NULL, "k"), "<bucket>") && ok;
+            s3c_copy_object(client, "b", "k", NULL, "k", NULL), "<bucket>") && ok;
     ok = expect_error_reply("copy_object null dst_key",
-            s3c_copy_object(client, "b", "k", "b", NULL), "<object_key>") && ok;
+            s3c_copy_object(client, "b", "k", "b", NULL, NULL), "<object_key>") && ok;
 
     ok = expect_error_reply("delete_object null bucket",
             s3c_delete_object(client, NULL, "k"), "<bucket>") && ok;
@@ -1822,7 +1822,7 @@ bool run_basic_tests(s3cClient* client)
     log_info("copy object...");
     s3c_reply_free(reply);
     reply = s3c_copy_object(client, TEST_BUCKET, object_key,
-                            TEST_BUCKET, copy_key);
+                            TEST_BUCKET, copy_key, NULL);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
@@ -1851,6 +1851,56 @@ bool run_basic_tests(s3cClient* client)
     log_info("delete copy...");
     s3c_reply_free(reply);
     reply = s3c_delete_object(client, TEST_BUCKET, copy_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    // copy with header replace (to separate key, set content-type)
+    const char* meta_copy_key = "test/file-meta-copy.bin";
+
+    log_info("copy object with headers (metadata replace)...");
+    s3c_reply_free(reply);
+
+    s3cKVL ct_header = {
+        .key = "Content-Type",
+        .value = "application/octet-stream",
+        .next = NULL,
+    };
+    reply = s3c_copy_object(client, TEST_BUCKET, object_key,
+                            TEST_BUCKET, meta_copy_key, &ct_header);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok resp code => %d\n", (int)reply->http_resp_code);
+
+    log_info("verify content-type after copy...");
+    s3c_reply_free(reply);
+    reply = s3c_head_object(client, TEST_BUCKET, meta_copy_key);
+
+    if (reply->error != NULL) {
+        log_err("error: %s\n", reply->error);
+        goto cleanup_and_ret;
+    }
+
+    s3cKVL* ct = s3c_kvl_find(reply->headers, "content-type");
+    if (ct == NULL || strcmp(ct->value, "application/octet-stream") != 0) {
+        log_err("error: expected content-type 'application/octet-stream', got '%s'\n",
+                ct ? ct->value : "(null)");
+        goto cleanup_and_ret;
+    }
+
+    log_info("ok content-type => %s\n", ct->value);
+
+    log_info("delete meta copy...");
+    s3c_reply_free(reply);
+    reply = s3c_delete_object(client, TEST_BUCKET, meta_copy_key);
 
     if (reply->error != NULL) {
         log_err("error: %s\n", reply->error);
